@@ -46,3 +46,11 @@ Establish clean 3-class dataset (SP1/SP2/SP4), eliminate batch effects.
 * \[ ] Sketch for multi-modal mCNN modelling architecture.
 * \[ ] Further searching for related works
 
+\## 2026-05-11 | LITERATURE
+
+FOUND: 2026 "A DNABERT based deep learning framework for predicting transcription factor binding sites" article
+
+\### Next
+
+* \[ ] Sketch data preparation
+* \[ ] Sketch for multi-modal mCNN modelling architecture.
