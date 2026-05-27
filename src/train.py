@@ -46,7 +46,7 @@ def train_model(model, train_loader, val_loader, epochs=15, lr=0.001, device='cu
     os.makedirs(output_dir, exist_ok=True)
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5)
 
     history = {
@@ -65,15 +65,22 @@ def train_model(model, train_loader, val_loader, epochs=15, lr=0.001, device='cu
         total = 0
         
         for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+            if isinstance(inputs, dict):
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+            else:
+                inputs = inputs.to(device)
+            targets = targets.to(device)
             
             optimizer.zero_grad()
-            outputs = model(inputs)
+            if isinstance(inputs, dict):
+                outputs = model(**inputs)
+            else:
+                outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
             
-            running_loss += loss.item() * inputs.size(0)
+            running_loss += loss.item() * targets.size(0)
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
@@ -89,11 +96,19 @@ def train_model(model, train_loader, val_loader, epochs=15, lr=0.001, device='cu
         
         with torch.no_grad():
             for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
+                if isinstance(inputs, dict):
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                else:
+                    inputs = inputs.to(device)
+                targets = targets.to(device)
+                
+                if isinstance(inputs, dict):
+                    outputs = model(**inputs)
+                else:
+                    outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 
-                val_loss += loss.item() * inputs.size(0)
+                val_loss += loss.item() * targets.size(0)
                 _, predicted = outputs.max(1)
                 val_total += targets.size(0)
                 val_correct += predicted.eq(targets).sum().item()
@@ -168,8 +183,15 @@ def evaluate_model(model, val_loader, class_names, device='cuda', save_dir='figu
     
     with torch.no_grad():
         for inputs, targets in val_loader:
-            inputs = inputs.to(device)
-            outputs = model(inputs)
+            if isinstance(inputs, dict):
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+            else:
+                inputs = inputs.to(device)
+            
+            if isinstance(inputs, dict):
+                outputs = model(**inputs)
+            else:
+                outputs = model(inputs)
             probs = torch.softmax(outputs, dim=1)
             
             _, preds = outputs.max(1)
