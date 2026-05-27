@@ -1,10 +1,14 @@
 import os
+import sys
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics.pairwise import cosine_similarity
+
+# Fix import path for direct execution
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.dnabert_wrapper import DNABERTWrapper
 
 def run_dnabert_diagnostics(sequences_dict, device='cuda', save_dir='figures'):

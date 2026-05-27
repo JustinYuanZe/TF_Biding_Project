@@ -1,7 +1,11 @@
 import os
+import sys
 import argparse
 import numpy as np
 import torch
+
+# Fix import path for direct script execution
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from src.mcnn_model import MultiScaleCNN

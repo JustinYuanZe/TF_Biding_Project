@@ -1,7 +1,11 @@
 import os
+import sys
 import argparse
 import numpy as np
 import torch
+
+# Fix import path for direct script execution
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.dnabert_wrapper import DNABERTWrapper
 
 def load_fasta(path):
