@@ -23,7 +23,12 @@ class DNABERTWrapper:
         if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
             config.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 3
             
-        self.model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=trust_remote_code).to(self.device)
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            config=config,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=False
+        ).to(self.device)
         self.model.eval()
         print("DNABERT-2 loaded successfully.")
 
