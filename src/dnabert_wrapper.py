@@ -16,7 +16,14 @@ class DNABERTWrapper:
             
         print(f"Loading DNABERT-2 model and tokenizer on {self.device}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-        self.model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote_code).to(self.device)
+        
+        # Resolve AttributeError: 'BertConfig' object has no attribute 'pad_token_id'
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+        if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+            config.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 3
+            
+        self.model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=trust_remote_code).to(self.device)
         self.model.eval()
         print("DNABERT-2 loaded successfully.")
 
