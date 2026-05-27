@@ -18,16 +18,25 @@ from sklearn.metrics import (
 class DNAEmbeddingDataset(Dataset):
     """
     Custom PyTorch Dataset for loading pre-extracted DNABERT-2 embeddings and labels.
+    Uses memory-sharing (torch.from_numpy) to prevent duplicating large arrays in RAM.
     """
     def __init__(self, embeddings, labels):
-        self.embeddings = torch.tensor(embeddings, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.long)
+        if isinstance(embeddings, np.ndarray):
+            self.embeddings = torch.from_numpy(embeddings)
+        else:
+            self.embeddings = embeddings
+
+        if isinstance(labels, np.ndarray):
+            self.labels = torch.from_numpy(labels)
+        else:
+            self.labels = labels
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return self.embeddings[idx], self.labels[idx]
+        # Convert to float32/long dynamically during batch collation
+        return self.embeddings[idx].to(torch.float32), self.labels[idx].to(torch.long)
 
 
 def train_model(model, train_loader, val_loader, epochs=15, lr=0.001, device='cuda', output_dir='models'):

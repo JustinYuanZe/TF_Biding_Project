@@ -262,11 +262,13 @@ class DNABERTWrapper:
         self.model.eval()
         print(f"DNABERT-2 loaded successfully on {self.device}.")
 
-    def get_embeddings(self, sequences, batch_size=64, max_length=105):
+    def get_embeddings(self, sequences, batch_size=64, max_length=105, dtype=np.float16):
         """
         Extract token-level embeddings of shape (n_samples, seq_len, 768) from DNA sequences.
         Ensures a fixed sequence length by using padding='max_length'.
+        Uses float16 by default to save 50% RAM/VRAM memory.
         """
+        import gc
         embeddings_list = []
 
         with torch.no_grad():
@@ -282,10 +284,19 @@ class DNABERTWrapper:
                 ).to(self.device)
 
                 outputs = self.model(**inputs)
-                batch_embeddings = outputs[0].cpu().numpy().astype(np.float32)
+                batch_embeddings = outputs[0].cpu().numpy().astype(dtype)
                 embeddings_list.append(batch_embeddings)
+                
+                del inputs, outputs
+                if i % (batch_size * 5) == 0 and self.device.type == "cuda":
+                    torch.cuda.empty_cache()
 
-        return np.concatenate(embeddings_list, axis=0)
+        res = np.concatenate(embeddings_list, axis=0)
+        del embeddings_list
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return res
 
     def get_cls_embeddings(self, sequences, batch_size=64):
         """
