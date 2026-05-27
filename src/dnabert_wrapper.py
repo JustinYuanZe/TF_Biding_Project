@@ -220,9 +220,26 @@ class DNABERTWrapper:
                     weight_file = hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
                     state_dict = torch.load(weight_file, map_location="cpu", weights_only=False)
 
-                result = model.load_state_dict(state_dict, strict=False)
+                # Clean state dict keys (strip 'bert.' prefix if it exists)
+                clean_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith("bert."):
+                        clean_state_dict[k[5:]] = v
+                    else:
+                        clean_state_dict[k] = v
+
+                result = model.load_state_dict(clean_state_dict, strict=False)
+                
+                # Check for critical missing keys
+                missing_set = set(result.missing_keys)
+                critical_keys = ["embeddings.word_embeddings.weight", "encoder.layer.0.attention.self.Wqkv.weight"]
+                for ck in critical_keys:
+                    if ck in missing_set:
+                        raise RuntimeError(f"Core weight '{ck}' is missing after loading state dict! Load failed.")
+                
                 if result.missing_keys:
-                    print(f"  Missing keys (OK for ALiBi buffers): {result.missing_keys[:5]}...")
+                    print(f"  Missing keys (should only be pooler/non-critical): {result.missing_keys[:5]}...")
+                
                 model = model.to("cpu")
                 print("  Strategy 2 succeeded.")
             except Exception as e:
