@@ -69,3 +69,63 @@ class MultiScaleCNN(nn.Module):
         # Classification prediction logits
         out = self.fc_head(feat)
         return out
+
+
+class ImprovedOneHotCNN(nn.Module):
+    """
+    Highly regularized CNN for raw DNA sequences to prevent overfitting on small datasets.
+    Key features:
+    1. Learnable Embedding Layer: maps 4 base categories to a continuous 32-dim space.
+    2. Conv1D branches with internal dropout to prevent co-adaptation of filters.
+    3. Global MAX + AVG Pooling: MAX captures motif presence; AVG captures motif abundance/frequency.
+    4. Small model capacity (~85K parameters) to avoid memorizing small training sets.
+    """
+    def __init__(self, seq_len=101, num_classes=4, embedding_dim=32, branch_channels=64, kernel_sizes=[3, 5, 7, 9], dropout_rate=0.6):
+        super(ImprovedOneHotCNN, self).__init__()
+        # Categories: A=0, C=1, G=2, T=3, N/Padding=4
+        self.embedding = nn.Embedding(5, embedding_dim, padding_idx=4)
+        
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(
+                    in_channels=embedding_dim,
+                    out_channels=branch_channels,
+                    kernel_size=k,
+                    padding=k // 2
+                ),
+                nn.BatchNorm1d(branch_channels),
+                nn.ReLU(),
+                nn.Dropout(p=0.2) # Regularize intermediate feature maps
+            ) for k in kernel_sizes
+        ])
+        
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Concat feature size = number of branches * branch channels * 2 (max + avg pools)
+        concatenated_dim = len(kernel_sizes) * branch_channels * 2
+        
+        self.fc_head = nn.Sequential(
+            nn.Linear(concatenated_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        # x shape: (batch_size, seq_len) -> integer indices
+        x = self.embedding(x)  # Shape: (batch_size, seq_len, embedding_dim)
+        x = x.transpose(1, 2)  # Shape: (batch_size, embedding_dim, seq_len)
+        
+        branch_feats = []
+        for branch in self.branches:
+            feat = branch(x)
+            max_feat = self.max_pool(feat).squeeze(-1)
+            avg_feat = self.avg_pool(feat).squeeze(-1)
+            branch_feats.extend([max_feat, avg_feat])
+            
+        feat = torch.cat(branch_feats, dim=1) # Shape: (batch_size, concatenated_dim)
+        out = self.fc_head(feat)
+        return out
+
