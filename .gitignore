@@ -1,3 +1,8 @@
 data/*
 !data/processed/
+data/processed/OLD/
+data/processed/*.zip
 models/
+ref/**/*.pdf
+ref/*.pdf
+scratch/
