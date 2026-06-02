@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import label_binarize
 from sklearn.metrics import (
@@ -100,24 +100,49 @@ def main():
         np.full(len(seqs_neg), 3)
     ], axis=0)
 
-    # 2. Feature Extraction (k-mer TF-IDF)
+    # 2. Build group IDs to prevent reverse-complement data leakage.
+    # In positive FASTA files, sequences alternate: [orig_0, rc_0, orig_1, rc_1, ...]
+    # A sequence and its reverse complement MUST stay in the same split,
+    # otherwise the model has effectively "seen" the test sample in a different form.
+    # Negative sequences are independent (each is its own group).
+    groups = []
+    group_id = 0
+    for class_seqs in [seqs_sp1, seqs_sp2, seqs_sp4]:
+        for i in range(0, len(class_seqs), 2):
+            groups.extend([group_id, group_id])
+            group_id += 1
+    for _ in seqs_neg:
+        groups.append(group_id)
+        group_id += 1
+    groups = np.array(groups)
+
+    # 3. Split raw sequences FIRST, THEN extract features (prevents TF-IDF leakage).
+    # Use GroupShuffleSplit to keep orig/revcomp pairs in the same split.
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(gss.split(sequences, y, groups))
+
+    seq_train = [sequences[i] for i in train_idx]
+    seq_test = [sequences[i] for i in test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    print(f"\nTrain/Test split (group-aware): {len(seq_train)} train, {len(seq_test)} test")
+    print(f"  Train class distribution: {np.bincount(y_train.astype(int))}")
+    print(f"  Test  class distribution: {np.bincount(y_test.astype(int))}")
+
+    # 4. Feature Extraction (k-mer TF-IDF) — fit ONLY on training data
     print("\nExtracting k-mer TF-IDF features (k=3 to 5)...")
     t0 = time.time()
     vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(3, 5))
-    X = vectorizer.fit_transform(sequences)
-    print(f"Feature matrix shape: {X.shape} (extracted in {time.time() - t0:.2f}s)")
+    X_train = vectorizer.fit_transform(seq_train)   # fit + transform on train
+    X_test = vectorizer.transform(seq_test)          # transform only on test
+    print(f"Feature matrix: Train {X_train.shape}, Test {X_test.shape} (extracted in {time.time() - t0:.2f}s)")
 
-    # 3. Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
-    )
-    print(f"Train set: {X_train.shape[0]} samples, Test set: {X_test.shape[0]} samples")
-
-    # Convert X_train to dense array for classifiers that don't support sparse matrix format directly
+    # Convert to dense for classifiers that don't support sparse input
     X_train_dense = X_train.toarray()
     X_test_dense = X_test.toarray()
 
-    # 4. Define 9 Classifiers
+    # 5. Define 9 Classifiers
     models = {
         "Logistic Regression": (LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1), False),
         "Decision Tree": (DecisionTreeClassifier(max_depth=10, random_state=42), False),
@@ -130,7 +155,7 @@ def main():
         "MLP": (MLPClassifier(hidden_layer_sizes=(50,), max_iter=200, early_stopping=True, random_state=42), False),
     }
 
-    # 5. Training Loop and Evaluation
+    # 6. Training Loop and Evaluation
     results = []
     confusion_matrices = {}
     roc_curves_data = {}
@@ -190,7 +215,7 @@ def main():
     print("\n=== PERFORMANCE SUMMARY ===")
     print(df_results.to_string(index=False))
 
-    # 6. Generate comparative graphs
+    # 7. Generate comparative graphs
     print("\nGenerating performance comparison graphs...")
     
     # Plot 1: Performance comparison bar plot
