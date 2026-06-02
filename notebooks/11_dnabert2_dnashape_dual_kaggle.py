@@ -118,8 +118,8 @@ class Config:
 
     # ── Paths ──
     # Kaggle: /kaggle/input/<dataset-name>/
-    # Local:  data/processed/
-    DATA_DIR = "data/processed"
+    FASTA_DIR = "/kaggle/input/dataset2" if os.path.exists("/kaggle/input/dataset2") else "data/processed"
+    SHAPE_DIR = "/kaggle/input/dataset-shape" if os.path.exists("/kaggle/input/dataset-shape") else "data/processed"
     OUTPUT_DIR = "outputs_dual_branch"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
@@ -235,17 +235,17 @@ def load_shape_features(data_dir, shape_files):
     return np.concatenate(all_shapes, axis=0)  # [N_total, 5, 101]
 
 
-def load_all_data(data_dir, shape_files):
+def load_all_data(fasta_dir, shape_dir, shape_files):
     """Load all 4 classes: sequences + shape features + group-aware labels."""
     print("=" * 60)
     print("LOADING DATASETS (Sequences + DNAshape Features)")
     print("=" * 60)
 
     fasta_files = {
-        "SP1": os.path.join(data_dir, "sp1_positive_final.fasta"),
-        "SP2": os.path.join(data_dir, "sp2_positive_final.fasta"),
-        "SP4": os.path.join(data_dir, "sp4_positive_final.fasta"),
-        "Negative": os.path.join(data_dir, "negative_final.fasta"),
+        "SP1": os.path.join(fasta_dir, "sp1_positive_final.fasta"),
+        "SP2": os.path.join(fasta_dir, "sp2_positive_final.fasta"),
+        "SP4": os.path.join(fasta_dir, "sp4_positive_final.fasta"),
+        "Negative": os.path.join(fasta_dir, "negative_final.fasta"),
     }
 
     all_sequences = []
@@ -276,7 +276,7 @@ def load_all_data(data_dir, shape_files):
 
     # Load shape features in the same class order
     print("\n  Loading DNAshape features...")
-    all_shapes = load_shape_features(data_dir, shape_files)
+    all_shapes = load_shape_features(shape_dir, shape_files)
 
     assert len(all_sequences) == all_shapes.shape[0], (
         f"Sequence count ({len(all_sequences)}) != shape count ({all_shapes.shape[0]})"
@@ -318,7 +318,7 @@ def split_data(sequences, labels, groups, shapes, test_size=0.2, seed=42):
 
 # Load and split
 all_sequences, all_labels, all_groups, all_shapes = load_all_data(
-    cfg.DATA_DIR, cfg.SHAPE_FILES
+    cfg.FASTA_DIR, cfg.SHAPE_DIR, cfg.SHAPE_FILES
 )
 seq_train, seq_test, y_train, y_test, shape_train, shape_test = split_data(
     all_sequences, all_labels, all_groups, all_shapes,
