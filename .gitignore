@@ -6,3 +6,6 @@ models/
 ref/**/*.pdf
 ref/*.pdf
 scratch/
+data/processed/*.npy
+**/__pycache__/
+.ipynb_checkpoints/
