@@ -109,12 +109,25 @@ if torch.cuda.is_available():
 # CELL 2: Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
+def auto_detect_dir(target_file, fallback="data/processed"):
+    """Search for the directory containing target_file in Kaggle input or local path."""
+    # First check fallback
+    if os.path.exists(fallback) and os.path.exists(os.path.join(fallback, target_file)):
+        return fallback
+    # Then search in /kaggle/input (recursive)
+    if os.path.exists("/kaggle/input"):
+        for root, _, files in os.walk("/kaggle/input"):
+            if target_file in files:
+                print(f"  [Auto-detect] Found {target_file} at {root}")
+                return root
+    return fallback
+
 class Config:
     """Central configuration for the Balanced Dual-Branch pipeline."""
 
     # ── Paths ──
-    FASTA_DIR = "/kaggle/input/datasets/lehotrongtin/dataset2" if os.path.exists("/kaggle/input/datasets/lehotrongtin/dataset2") else "data/processed"
-    SHAPE_DIR = "/kaggle/input/datasets/lehotrongtin/dataset-shape" if os.path.exists("/kaggle/input/datasets/lehotrongtin/dataset-shape") else "data/processed"
+    FASTA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
+    SHAPE_DIR = auto_detect_dir("dnashape_sp1.npy", "data/processed")
     OUTPUT_DIR = "outputs_balanced_dual"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
@@ -126,10 +139,10 @@ class Config:
 
     # ── Fine-Tuning Strategy ──
     UNFREEZE_LAST_N_LAYERS = 3    # Unfreeze last 3 of 12 encoder layers
-    BACKBONE_LR = 2e-5            # Lower LR for pre-trained layers
-    SHAPE_LR = 5e-4               # Medium LR for shape CNN branch (train from scratch)
-    HEAD_LR = 2e-4                # ★ CHANGED: Reduced from 1e-3 to 2e-4 (slower head)
-    WEIGHT_DECAY = 0.05           # ★ CHANGED: Increased from 0.01 to 0.05
+    BACKBONE_LR = 1.5e-5          # Reduced slightly
+    SHAPE_LR = 1e-4               # Reduced from 5e-4 to 1e-4 (slower Shape CNN learning)
+    HEAD_LR = 5e-5                # Reduced from 2e-4 to 5e-5 (slower head learning)
+    WEIGHT_DECAY = 0.1            # Increased from 0.05 to 0.1 (stronger regularization)
 
     # ── DNAshape Branch ──
     SHAPE_CHANNELS = 5            # MGW, ProT, Roll, HelT, EP
@@ -225,6 +238,17 @@ def load_shape_features(data_dir, shape_files):
     Returns concatenated array in class order: SP1, SP2, SP4, Negative.
     """
     all_shapes = []
+    
+    # Dynamically find the negative shape file if it exists under another name
+    shape_files = dict(shape_files)
+    neg_candidates = ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]
+    for cand in neg_candidates:
+        if os.path.exists(os.path.join(data_dir, cand)):
+            shape_files["Negative"] = cand
+            break
+            
+    print(f"  [Auto-detect] Using negative shape file: {shape_files['Negative']}")
+
     for cls_name, fname in shape_files.items():
         fpath = os.path.join(data_dir, fname)
         if not os.path.exists(fpath):
@@ -244,11 +268,21 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     print("LOADING DATASETS (Sequences + DNAshape Features)")
     print("=" * 60)
 
+    # Detect negative FASTA file
+    neg_fasta = "negative_final.fasta"
+    fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
+    for cand in fasta_candidates:
+        if os.path.exists(os.path.join(fasta_dir, cand)):
+            neg_fasta = cand
+            break
+
+    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta}")
+
     fasta_files = {
         "SP1": os.path.join(fasta_dir, "sp1_positive_final.fasta"),
         "SP2": os.path.join(fasta_dir, "sp2_positive_final.fasta"),
         "SP4": os.path.join(fasta_dir, "sp4_positive_final.fasta"),
-        "Negative": os.path.join(fasta_dir, "negative_final.fasta"),
+        "Negative": os.path.join(fasta_dir, neg_fasta),
     }
 
     all_sequences = []
@@ -899,7 +933,16 @@ def lr_lambda(current_step):
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-criterion = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
+# Compute class weights for 4-class classification imbalance (SP1, SP2, SP4, Negative)
+class_counts = np.bincount(y_train)
+total_count = len(y_train)
+num_classes = len(class_counts)
+
+class_weights = total_count / (num_classes * class_counts.astype(np.float32))
+class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+print(f"  [Auto-detect] Class weights for loss function: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(num_classes)]))
+
+criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.LABEL_SMOOTHING)
 scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
 
 # Print model summary

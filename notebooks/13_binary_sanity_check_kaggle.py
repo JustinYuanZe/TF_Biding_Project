@@ -95,12 +95,30 @@ if torch.cuda.is_available():
 # CELL 2: Configuration — BINARY (2-class)
 # ═══════════════════════════════════════════════════════════════════════
 
+def auto_detect_dir(target_file, fallback="data/processed"):
+    """Search for the directory containing target_file in Kaggle input or local path."""
+    # First check fallback
+    if os.path.exists(fallback) and os.path.exists(os.path.join(fallback, target_file)):
+        return fallback
+    # Then search in /kaggle/input (recursive)
+    if os.path.exists("/kaggle/input"):
+        for root, _, files in os.walk("/kaggle/input"):
+            if target_file in files:
+                print(f"  [Auto-detect] Found {target_file} at {root}")
+                return root
+    return fallback
+
 class Config:
     """Central configuration for Binary Sanity Check."""
 
+    # ── Task Option ──
+    # True: SP1 vs Negative (1,696 vs 3,392)
+    # False: SP1+SP2+SP4 vs Negative (5,088 vs 3,392)
+    ONLY_SP1 = True
+
     # ── Paths ──
-    FASTA_DIR = "/kaggle/input/datasets/lehotrongtin/dataset2" if os.path.exists("/kaggle/input/datasets/lehotrongtin/dataset2") else "data/processed"
-    SHAPE_DIR = "/kaggle/input/datasets/lehotrongtin/dataset-shape" if os.path.exists("/kaggle/input/datasets/lehotrongtin/dataset-shape") else "data/processed"
+    FASTA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
+    SHAPE_DIR = auto_detect_dir("dnashape_sp1.npy", "data/processed")
     OUTPUT_DIR = "outputs_binary_sanity"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
@@ -112,10 +130,10 @@ class Config:
 
     # ── Fine-Tuning Strategy (same as Script 12) ──
     UNFREEZE_LAST_N_LAYERS = 3
-    BACKBONE_LR = 2e-5
-    SHAPE_LR = 5e-4
-    HEAD_LR = 2e-4
-    WEIGHT_DECAY = 0.05
+    BACKBONE_LR = 1.5e-5          # Reduced slightly
+    SHAPE_LR = 1e-4               # Reduced from 5e-4 to 1e-4 (slower Shape CNN learning)
+    HEAD_LR = 5e-5                # Reduced from 2e-4 to 5e-5 (slower head learning)
+    WEIGHT_DECAY = 0.1            # Increased from 0.05 to 0.1 (stronger regularization)
 
     # ── DNAshape Branch (same as Script 12) ──
     SHAPE_CHANNELS = 5
@@ -202,6 +220,17 @@ def load_fasta(filepath):
 def load_shape_features(data_dir, shape_files):
     """Load pre-computed DNAshape feature matrices (.npy)."""
     all_shapes = []
+    
+    # Dynamically find the negative shape file if it exists under another name
+    shape_files = dict(shape_files)
+    neg_candidates = ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]
+    for cand in neg_candidates:
+        if os.path.exists(os.path.join(data_dir, cand)):
+            shape_files["Negative"] = cand
+            break
+            
+    print(f"  [Auto-detect] Using negative shape file: {shape_files['Negative']}")
+
     for cls_name, fname in shape_files.items():
         fpath = os.path.join(data_dir, fname)
         if not os.path.exists(fpath):
@@ -216,27 +245,44 @@ def load_shape_features(data_dir, shape_files):
 
 
 def load_all_data(fasta_dir, shape_dir, shape_files):
-    """Load all 4 classes, then REMAP to binary labels."""
+    """Load classes, then REMAP to binary labels (optionally only SP1)."""
     print("=" * 60)
     print("LOADING DATASETS — BINARY SANITY CHECK")
     print("=" * 60)
 
-    fasta_files = {
-        "SP1": os.path.join(fasta_dir, "sp1_positive_final.fasta"),
-        "SP2": os.path.join(fasta_dir, "sp2_positive_final.fasta"),
-        "SP4": os.path.join(fasta_dir, "sp4_positive_final.fasta"),
-        "Negative": os.path.join(fasta_dir, "negative_final.fasta"),
-    }
+    # Detect negative FASTA file
+    neg_fasta = "negative_final.fasta"
+    fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
+    for cand in fasta_candidates:
+        if os.path.exists(os.path.join(fasta_dir, cand)):
+            neg_fasta = cand
+            break
+
+    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta}")
+
+    if cfg.ONLY_SP1:
+        fasta_files = {
+            "SP1": os.path.join(fasta_dir, "sp1_positive_final.fasta"),
+            "Negative": os.path.join(fasta_dir, neg_fasta),
+        }
+        # Filter shape_files to only SP1 and Negative
+        shape_files = {k: v for k, v in shape_files.items() if k in ["SP1", "Negative"]}
+        binary_map = {"SP1": 1, "Negative": 0}
+        print("  ★ TASK CONFIGURATION: ONLY SP1 vs Negative (SP2/SP4 excluded)")
+    else:
+        fasta_files = {
+            "SP1": os.path.join(fasta_dir, "sp1_positive_final.fasta"),
+            "SP2": os.path.join(fasta_dir, "sp2_positive_final.fasta"),
+            "SP4": os.path.join(fasta_dir, "sp4_positive_final.fasta"),
+            "Negative": os.path.join(fasta_dir, neg_fasta),
+        }
+        binary_map = {"SP1": 1, "SP2": 1, "SP4": 1, "Negative": 0}
+        print("  ★ TASK CONFIGURATION: SP1+SP2+SP4 vs Negative")
 
     all_sequences = []
     all_labels = []
     all_groups = []
     group_id = 0
-
-    # ★ BINARY REMAPPING:
-    #   SP1, SP2, SP4  → Label 1 (Positive)
-    #   Negative       → Label 0
-    binary_map = {"SP1": 1, "SP2": 1, "SP4": 1, "Negative": 0}
 
     for cls_name, fpath in fasta_files.items():
         seqs = load_fasta(fpath)
@@ -772,7 +818,18 @@ def lr_lambda(current_step):
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-criterion = nn.CrossEntropyLoss(label_smoothing=cfg.LABEL_SMOOTHING)
+# Compute class weights for binary classification imbalance
+neg_count = np.sum(y_train == 0)
+pos_count = np.sum(y_train == 1)
+total_count = neg_count + pos_count
+
+w_neg = total_count / (2.0 * neg_count) if neg_count > 0 else 1.0
+w_pos = total_count / (2.0 * pos_count) if pos_count > 0 else 1.0
+
+class_weights = torch.tensor([w_neg, w_pos], dtype=torch.float32, device=DEVICE)
+print(f"  [Auto-detect] Class weights for loss function: Neg={w_neg:.4f}, Pos={w_pos:.4f}")
+
+criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.LABEL_SMOOTHING)
 scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
 
 # Print model summary
