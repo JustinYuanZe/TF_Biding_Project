@@ -109,17 +109,40 @@ if torch.cuda.is_available():
 # CELL 2: Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-def auto_detect_dir(target_file, fallback="data/processed"):
-    """Search for the directory containing target_file in Kaggle input or local path."""
-    # First check fallback
-    if os.path.exists(fallback) and os.path.exists(os.path.join(fallback, target_file)):
-        return fallback
-    # Then search in /kaggle/input (recursive)
+def find_file(filename, fallback_dir="data/processed"):
+    """Search for target_file in absolute paths, Kaggle input, fallback dirs, or current directory."""
+    if os.path.isabs(filename) and os.path.exists(filename):
+        return filename
+    
+    # 1. Prioritize recursive search in /kaggle/input
     if os.path.exists("/kaggle/input"):
         for root, _, files in os.walk("/kaggle/input"):
-            if target_file in files:
-                print(f"  [Auto-detect] Found {target_file} at {root}")
-                return root
+            if filename in files:
+                fpath = os.path.join(root, filename)
+                print(f"  [Auto-detect] Found {filename} at {fpath}")
+                return fpath
+                
+    # 2. Check fallback dir and its subdirectory 'fixed_negative'
+    if fallback_dir and os.path.exists(fallback_dir):
+        p1 = os.path.join(fallback_dir, filename)
+        if os.path.exists(p1):
+            return p1
+        p2 = os.path.join(fallback_dir, "fixed_negative", filename)
+        if os.path.exists(p2):
+            return p2
+            
+    # 3. Check current working directory
+    if os.path.exists(filename):
+        return filename
+        
+    return None
+
+
+def auto_detect_dir(target_file, fallback="data/processed"):
+    """Search for the directory containing target_file in Kaggle input or local path."""
+    resolved_path = find_file(target_file, fallback)
+    if resolved_path:
+        return os.path.dirname(resolved_path)
     return fallback
 
 class Config:
@@ -245,28 +268,34 @@ def load_shape_features(data_dir, shape_files):
     all_shapes = []
     
     # Dynamically find the negative shape file if it exists under another name
-    shape_files = dict(shape_files)
+    neg_shape_path = None
     neg_candidates = ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]
     for cand in neg_candidates:
-        if os.path.exists(os.path.join(data_dir, cand)):
-            shape_files["Negative"] = cand
-            break
-        elif os.path.exists(os.path.join(data_dir, "fixed_negative", cand)):
-            shape_files["Negative"] = os.path.join("fixed_negative", cand)
+        path = find_file(cand, data_dir)
+        if path:
+            neg_shape_path = path
             break
             
-    print(f"  [Auto-detect] Using negative shape file: {shape_files['Negative']}")
+    if not neg_shape_path:
+        raise FileNotFoundError("Could not find any negative DNAshape file among candidates.")
+            
+    print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
 
+    resolved_paths = {}
     for cls_name, fname in shape_files.items():
-        fpath = os.path.join(data_dir, fname)
-        if not os.path.exists(fpath):
-            raise FileNotFoundError(
-                f"Missing DNAshape file: {fpath}\n"
-                f"Run src/extract_dnashape.py first, then upload .npy files to Kaggle."
-            )
+        if cls_name == "Negative":
+            resolved_paths[cls_name] = neg_shape_path
+        else:
+            path = find_file(fname, data_dir)
+            if not path:
+                raise FileNotFoundError(f"Missing DNAshape file for {cls_name}: {fname}")
+            resolved_paths[cls_name] = path
+
+    for cls_name, fpath in resolved_paths.items():
         shape_data = np.load(fpath)  # [N, 5, 101]
-        print(f"  {cls_name} shape: {shape_data.shape}")
+        print(f"  {cls_name} shape: {shape_data.shape} ({os.path.basename(fpath)})")
         all_shapes.append(shape_data)
+        
     return np.concatenate(all_shapes, axis=0)  # [N_total, 5, 101]
 
 
@@ -277,24 +306,31 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     print("=" * 60)
 
     # Detect negative FASTA file
-    neg_fasta = "negative_final.fasta"
+    neg_fasta_path = None
     fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
     for cand in fasta_candidates:
-        if os.path.exists(os.path.join(fasta_dir, cand)):
-            neg_fasta = cand
+        path = find_file(cand, fasta_dir)
+        if path:
+            neg_fasta_path = path
             break
-        elif os.path.exists(os.path.join(fasta_dir, "fixed_negative", cand)):
-            neg_fasta = os.path.join("fixed_negative", cand)
-            break
+            
+    if not neg_fasta_path:
+        raise FileNotFoundError("Could not find any negative FASTA file among candidates.")
 
-    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta}")
+    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
 
+    # Build file paths for all classes
     fasta_files = {
-        "SP1": os.path.join(fasta_dir, "sp1_positive_final.fasta"),
-        "SP2": os.path.join(fasta_dir, "sp2_positive_final.fasta"),
-        "SP4": os.path.join(fasta_dir, "sp4_positive_final.fasta"),
-        "Negative": os.path.join(fasta_dir, neg_fasta),
+        "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
+        "SP2": find_file("sp2_positive_final.fasta", fasta_dir),
+        "SP4": find_file("sp4_positive_final.fasta", fasta_dir),
+        "Negative": neg_fasta_path,
     }
+
+    # Verify all are resolved
+    for cls_name, fpath in fasta_files.items():
+        if not fpath:
+            raise FileNotFoundError(f"Missing FASTA file for {cls_name}")
 
     all_sequences = []
     all_headers = []
@@ -304,7 +340,7 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
 
     for cls_idx, (cls_name, fpath) in enumerate(fasta_files.items()):
         seqs, hdrs = load_fasta(fpath)
-        print(f"  {cls_name}: {len(seqs)} sequences")
+        print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
         all_sequences.extend(seqs)
         all_headers.extend(hdrs)
         all_labels.extend([cls_idx] * len(seqs))

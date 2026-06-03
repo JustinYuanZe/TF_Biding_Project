@@ -85,14 +85,40 @@ class ImprovedOneHotCNN(nn.Module):
         out = self.fc_head(feat)
         return out
 
-def auto_detect_dir(target_file, fallback="data/processed"):
-    """Search for target_file in local path or Kaggle directory."""
-    if os.path.exists(fallback) and os.path.exists(os.path.join(fallback, target_file)):
-        return fallback
+def find_file(filename, fallback_dir="data/processed"):
+    """Search for target_file in absolute paths, Kaggle input, fallback dirs, or current directory."""
+    if os.path.isabs(filename) and os.path.exists(filename):
+        return filename
+    
+    # 1. Prioritize recursive search in /kaggle/input
     if os.path.exists("/kaggle/input"):
         for root, _, files in os.walk("/kaggle/input"):
-            if target_file in files:
-                return root
+            if filename in files:
+                fpath = os.path.join(root, filename)
+                print(f"  [Auto-detect] Found {filename} at {fpath}")
+                return fpath
+                
+    # 2. Check fallback dir and its subdirectory 'fixed_negative'
+    if fallback_dir and os.path.exists(fallback_dir):
+        p1 = os.path.join(fallback_dir, filename)
+        if os.path.exists(p1):
+            return p1
+        p2 = os.path.join(fallback_dir, "fixed_negative", filename)
+        if os.path.exists(p2):
+            return p2
+            
+    # 3. Check current working directory
+    if os.path.exists(filename):
+        return filename
+        
+    return None
+
+
+def auto_detect_dir(target_file, fallback="data/processed"):
+    """Search for target_file in local path or Kaggle directory."""
+    resolved_path = find_file(target_file, fallback)
+    if resolved_path:
+        return os.path.dirname(resolved_path)
     return fallback
 
 def load_fasta(filepath):
@@ -154,25 +180,31 @@ def main():
     print("LOADING DATASETS (One-Hot + mCNN)")
     print("=" * 60)
     
-    neg_fasta = "negative_final.fasta"
+    neg_fasta_path = None
     fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
     for cand in fasta_candidates:
-        if os.path.exists(os.path.join(fasta_dir, cand)):
-            neg_fasta = cand
-            break
-        elif os.path.exists(os.path.join(fasta_dir, "fixed_negative", cand)):
-            neg_fasta = os.path.join("fixed_negative", cand)
+        path = find_file(cand, fasta_dir)
+        if path:
+            neg_fasta_path = path
             break
             
-    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta}")
+    if not neg_fasta_path:
+        raise FileNotFoundError("Could not find any negative FASTA file among candidates.")
+            
+    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
     
     fasta_files = {
-        "SP1": os.path.join(fasta_dir, "sp1_positive_final.fasta"),
-        "SP2": os.path.join(fasta_dir, "sp2_positive_final.fasta"),
-        "SP4": os.path.join(fasta_dir, "sp4_positive_final.fasta"),
-        "Negative": os.path.join(fasta_dir, neg_fasta)
+        "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
+        "SP2": find_file("sp2_positive_final.fasta", fasta_dir),
+        "SP4": find_file("sp4_positive_final.fasta", fasta_dir),
+        "Negative": neg_fasta_path
     }
     
+    # Verify all are resolved
+    for cls_name, fpath in fasta_files.items():
+        if not fpath:
+            raise FileNotFoundError(f"Missing FASTA file for {cls_name}")
+            
     all_sequences = []
     all_headers = []
     all_labels = []
@@ -181,7 +213,7 @@ def main():
     
     for cls_idx, (cls_name, fpath) in enumerate(fasta_files.items()):
         seqs, hdrs = load_fasta(fpath)
-        print(f"  {cls_name}: {len(seqs)} sequences")
+        print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
         all_sequences.extend(seqs)
         all_headers.extend(hdrs)
         all_labels.extend([cls_idx] * len(seqs))
