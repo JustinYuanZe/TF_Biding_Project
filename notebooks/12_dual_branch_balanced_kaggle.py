@@ -138,9 +138,9 @@ class Config:
     MAX_TOKEN_LENGTH = 512
 
     # ── Fine-Tuning Strategy ──
-    UNFREEZE_LAST_N_LAYERS = 3    # Unfreeze last 3 of 12 encoder layers
-    BACKBONE_LR = 1.5e-5          # Reduced slightly
-    SHAPE_LR = 1e-4               # Reduced from 5e-4 to 1e-4 (slower Shape CNN learning)
+    UNFREEZE_LAST_N_LAYERS = 6    # Unfreeze last 6 of 12 encoder layers
+    BACKBONE_LR = 1.0e-5          # Lower backbone LR for stability with more unfrozen layers
+    SHAPE_LR = 3.0e-4             # Increased to 3e-4 to allow ShapeCNN to train from scratch faster
     HEAD_LR = 5e-5                # Reduced from 2e-4 to 5e-5 (slower head learning)
     WEIGHT_DECAY = 0.1            # Increased from 0.05 to 0.1 (stronger regularization)
 
@@ -165,8 +165,8 @@ class Config:
     # ── Training ──
     BATCH_SIZE = 16               # Per-GPU batch size (T4-friendly)
     GRAD_ACCUM_STEPS = 4          # Effective batch = 16 × 4 = 64
-    EPOCHS = 20                   # ★ CHANGED: Increased from 15 to 20 (slower LR needs more epochs)
-    PATIENCE = 7                  # ★ CHANGED: Increased from 5 to 7
+    EPOCHS = 25                   # Increased epochs to 25
+    PATIENCE = 10                 # Increased patience to 10
     WARMUP_RATIO = 0.1            # 10% of total steps for warmup
 
     # ── Data Split ──
@@ -212,23 +212,28 @@ print(f"Effective batch size: {cfg.BATCH_SIZE} × {cfg.GRAD_ACCUM_STEPS} = {cfg.
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_fasta(filepath):
-    """Load DNA sequences from a FASTA file."""
+    """Load DNA sequences and their headers from a FASTA file."""
     sequences = []
+    headers = []
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Missing dataset: {filepath}")
     with open(filepath, "r") as f:
         seq_lines = []
+        current_header = None
         for line in f:
             line = line.strip()
             if line.startswith(">"):
                 if seq_lines:
                     sequences.append("".join(seq_lines).upper())
+                    headers.append(current_header)
                     seq_lines = []
+                current_header = line[1:]
             else:
                 seq_lines.append(line)
         if seq_lines:
             sequences.append("".join(seq_lines).upper())
-    return sequences
+            headers.append(current_header)
+    return sequences, headers
 
 
 def load_shape_features(data_dir, shape_files):
@@ -245,6 +250,9 @@ def load_shape_features(data_dir, shape_files):
     for cand in neg_candidates:
         if os.path.exists(os.path.join(data_dir, cand)):
             shape_files["Negative"] = cand
+            break
+        elif os.path.exists(os.path.join(data_dir, "fixed_negative", cand)):
+            shape_files["Negative"] = os.path.join("fixed_negative", cand)
             break
             
     print(f"  [Auto-detect] Using negative shape file: {shape_files['Negative']}")
@@ -275,6 +283,9 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         if os.path.exists(os.path.join(fasta_dir, cand)):
             neg_fasta = cand
             break
+        elif os.path.exists(os.path.join(fasta_dir, "fixed_negative", cand)):
+            neg_fasta = os.path.join("fixed_negative", cand)
+            break
 
     print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta}")
 
@@ -286,14 +297,16 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     }
 
     all_sequences = []
+    all_headers = []
     all_labels = []
     all_groups = []
     group_id = 0
 
     for cls_idx, (cls_name, fpath) in enumerate(fasta_files.items()):
-        seqs = load_fasta(fpath)
+        seqs, hdrs = load_fasta(fpath)
         print(f"  {cls_name}: {len(seqs)} sequences")
         all_sequences.extend(seqs)
+        all_headers.extend(hdrs)
         all_labels.extend([cls_idx] * len(seqs))
 
         # Build group IDs:
@@ -323,10 +336,10 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     print(f"  Shape features: {all_shapes.shape}")
     print(f"  Class distribution: {np.bincount(all_labels)}")
 
-    return all_sequences, all_labels, all_groups, all_shapes
+    return all_sequences, all_labels, all_groups, all_shapes, all_headers
 
 
-def split_data(sequences, labels, groups, shapes, test_size=0.2, seed=42):
+def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=42):
     """
     Group-aware train/test split.
     Ensures orig/revcomp pairs stay in the SAME split → no data leakage.
@@ -344,26 +357,28 @@ def split_data(sequences, labels, groups, shapes, test_size=0.2, seed=42):
     y_test = labels[test_idx]
     shape_train = shapes[train_idx]  # [N_train, 5, 101]
     shape_test = shapes[test_idx]    # [N_test, 5, 101]
+    headers_train = [headers[i] for i in train_idx]
+    headers_test = [headers[i] for i in test_idx]
 
     print(f"  Train: {len(seq_train)} sequences")
     print(f"  Test:  {len(seq_test)} sequences")
     print(f"  Train class dist: {np.bincount(y_train)}")
     print(f"  Test  class dist: {np.bincount(y_test)}")
 
-    return seq_train, seq_test, y_train, y_test, shape_train, shape_test
+    return seq_train, seq_test, y_train, y_test, shape_train, shape_test, headers_train, headers_test
 
 
 # Load and split
-all_sequences, all_labels, all_groups, all_shapes = load_all_data(
+all_sequences, all_labels, all_groups, all_shapes, all_headers = load_all_data(
     cfg.FASTA_DIR, cfg.SHAPE_DIR, cfg.SHAPE_FILES
 )
-seq_train, seq_test, y_train, y_test, shape_train, shape_test = split_data(
-    all_sequences, all_labels, all_groups, all_shapes,
+seq_train, seq_test, y_train, y_test, shape_train, shape_test, headers_train, headers_test = split_data(
+    all_sequences, all_labels, all_groups, all_shapes, all_headers,
     test_size=cfg.TEST_SIZE, seed=cfg.RANDOM_SEED,
 )
 
 # Free memory
-del all_sequences, all_labels, all_groups, all_shapes
+del all_sequences, all_labels, all_groups, all_shapes, all_headers
 gc.collect()
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1088,8 +1103,8 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             f"LR: {backbone_lr:.1e}/{shape_lr:.1e}/{head_lr:.1e} │ {elapsed:.1f}s"
         )
 
-        # Checkpoint based on val_loss
-        if val_loss < best_val_loss:
+        # Checkpoint based on val_acc (accuracy-based early stopping)
+        if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
@@ -1178,6 +1193,57 @@ def full_evaluation(model, test_loader, class_names, device):
 
 
 all_preds, all_targets, all_probs = full_evaluation(model, test_loader, cfg.CLASS_NAMES, DEVICE)
+
+# ── Post-processing: Export BED files for IGV Analysis ──
+def parse_header_to_bed(header):
+    """Parse FASTA header (e.g., 'chr8:142777203-142777304_revcomp') to BED format fields."""
+    try:
+        clean_hdr = header.split("_")[0]
+        chrom, coords = clean_hdr.split(":")
+        start, end = coords.split("-")
+        return chrom, start, end
+    except Exception:
+        return None
+
+def export_igv_bed_files(headers_test, predictions, targets, output_dir):
+    """Export BED files for true predictions and confused predictions for IGV analysis."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    true_sp1_coords = []
+    true_sp4_coords = []
+    confused_sp4_as_sp1_coords = []
+    
+    # Class indexing: SP1=0, SP2=1, SP4=2, Negative=3
+    for idx, (pred, target) in enumerate(zip(predictions, targets)):
+        header = headers_test[idx]
+        bed_fields = parse_header_to_bed(header)
+        if not bed_fields:
+            continue
+            
+        chrom, start, end = bed_fields
+        bed_line = f"{chrom}\t{start}\t{end}\n"
+        
+        if target == 0 and pred == 0:  # True SP1
+            true_sp1_coords.append(bed_line)
+        elif target == 2 and pred == 2:  # True SP4
+            true_sp4_coords.append(bed_line)
+        elif target == 2 and pred == 0:  # SP4 misclassified as SP1
+            confused_sp4_as_sp1_coords.append(bed_line)
+            
+    # Write BED files
+    with open(os.path.join(output_dir, "True_SP1.bed"), "w") as f:
+        f.writelines(true_sp1_coords)
+    with open(os.path.join(output_dir, "True_SP4.bed"), "w") as f:
+        f.writelines(true_sp4_coords)
+    with open(os.path.join(output_dir, "Confused_SP4_as_SP1.bed"), "w") as f:
+        f.writelines(confused_sp4_as_sp1_coords)
+        
+    print(f"\n  Exported BED files for IGV analysis to {output_dir}:")
+    print(f"    - True_SP1.bed: {len(true_sp1_coords)} lines")
+    print(f"    - True_SP4.bed: {len(true_sp4_coords)} lines")
+    print(f"    - Confused_SP4_as_SP1.bed: {len(confused_sp4_as_sp1_coords)} lines")
+
+export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 12: Generate All Performance Figures

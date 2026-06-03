@@ -54,6 +54,17 @@ DATA_DIR = "data/processed"
 FIG_DIR = "figures"
 CLASS_NAMES = ["SP1", "SP2", "SP4", "Negative"]
 
+def auto_detect_dir(target_file, fallback="data/processed"):
+    """Search for the directory containing target_file in Kaggle input or local path."""
+    if os.path.exists(fallback) and os.path.exists(os.path.join(fallback, target_file)):
+        return fallback
+    if os.path.exists("/kaggle/input"):
+        for root, _, files in os.walk("/kaggle/input"):
+            if target_file in files:
+                print(f"  [Auto-detect] Found {target_file} at {root}")
+                return root
+    return fallback
+
 def load_fasta(filepath):
     """Load DNA sequences from a FASTA file and convert to uppercase."""
     sequences = []
@@ -71,10 +82,25 @@ def main():
     print("=== TRAINING CLASSICAL ML BASELINES ===")
 
     # 1. Load Data
-    sp1_path = os.path.join(DATA_DIR, "sp1_positive_final.fasta")
-    sp2_path = os.path.join(DATA_DIR, "sp2_positive_final.fasta")
-    sp4_path = os.path.join(DATA_DIR, "sp4_positive_final.fasta")
-    neg_path = os.path.join(DATA_DIR, "negative_final.fasta")
+    fasta_dir = auto_detect_dir("sp1_positive_final.fasta", DATA_DIR)
+    
+    # Detect negative FASTA file
+    neg_fasta = "negative_final.fasta"
+    fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
+    for cand in fasta_candidates:
+        if os.path.exists(os.path.join(fasta_dir, cand)):
+            neg_fasta = cand
+            break
+        elif os.path.exists(os.path.join(fasta_dir, "fixed_negative", cand)):
+            neg_fasta = os.path.join("fixed_negative", cand)
+            break
+
+    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta}")
+
+    sp1_path = os.path.join(fasta_dir, "sp1_positive_final.fasta")
+    sp2_path = os.path.join(fasta_dir, "sp2_positive_final.fasta")
+    sp4_path = os.path.join(fasta_dir, "sp4_positive_final.fasta")
+    neg_path = os.path.join(fasta_dir, neg_fasta)
 
     try:
         seqs_sp1 = load_fasta(sp1_path)
@@ -83,7 +109,7 @@ def main():
         seqs_neg = load_fasta(neg_path)
     except FileNotFoundError as e:
         print(f"Error: {e}")
-        print("Please run 'python src/prepare_final_dataset.py' first.")
+        print("Please ensure the dataset is properly mounted or prepared.")
         sys.exit(1)
 
     print(f"Loaded datasets:")
