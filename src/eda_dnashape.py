@@ -102,32 +102,32 @@ def perform_eda():
     # Save statistics report
     report_path = r"scratch\dnashape_eda_report.md"
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write("# Báo cáo Khảo sát EDA Đặc trưng DNAshape\n\n")
-        f.write("## 1. Thống kê mô tả toàn cục\n\n")
-        f.write("Dưới đây là bảng thống kê mô tả được tính toán trên toàn bộ tập dữ liệu (bao gồm cả positive và negative) sau khi loại bỏ các giá trị biên `NaN`:\n\n")
+        f.write("# DNAshape Features EDA Report\n\n")
+        f.write("## 1. Global Descriptive Statistics\n\n")
+        f.write("Below is the descriptive statistics table computed on the entire dataset (including both positive and negative) after removing boundary `NaN` values:\n\n")
         f.write(to_markdown_manual(df_stats) + "\n\n")
-        f.write("## 2. Nhận xét về phân phối của từng đặc trưng:\n\n")
+        f.write("## 2. Distribution Comments for Each Feature:\n\n")
         for feat in feature_names:
             row = df_stats[df_stats["Feature"] == feat].iloc[0]
             f.write(f"### {feat}\n")
-            f.write(f"- **Phạm vi giá trị (Min - Max):** {row['Min']:.2f} đến {row['Max']:.2f}\n")
+            f.write(f"- **Value Range (Min - Max):** {row['Min']:.2f} to {row['Max']:.2f}\n")
             f.write(f"- **Median (Mean):** {row['Median']:.2f} ({row['Mean']:.2f})\n")
-            f.write(f"- **P1 - P99 (Khoảng chứa 98% dữ liệu):** {row['P1']:.2f} đến {row['P99']:.2f}\n")
-            f.write(f"- **Hệ số bất đối xứng (Skewness):** {row['Skewness']:.3f}\n")
-            f.write(f"- **Hệ số nhọn (Kurtosis):** {row['Kurtosis']:.3f}\n")
+            f.write(f"- **P1 - P99 (Interval containing 98% of data):** {row['P1']:.2f} to {row['P99']:.2f}\n")
+            f.write(f"- **Skewness:** {row['Skewness']:.3f}\n")
+            f.write(f"- **Kurtosis:** {row['Kurtosis']:.3f}\n")
             
-            # Đưa ra nhận định ban đầu
+            # Provide initial assessment
             if abs(row['Skewness']) > 1.0:
-                f.write(f"- *Nhận xét:* Đặc trưng bị lệch rất mạnh (skewed). ")
+                f.write(f"- *Comment:* Feature is highly skewed. ")
             elif abs(row['Skewness']) > 0.5:
-                f.write(f"- *Nhận xét:* Đặc trưng bị lệch vừa phải. ")
+                f.write(f"- *Comment:* Feature is moderately skewed. ")
             else:
-                f.write(f"- *Nhận xét:* Đặc trưng khá đối xứng. ")
+                f.write(f"- *Comment:* Feature is relatively symmetric. ")
                 
             if row['Kurtosis'] > 1.0:
-                f.write(f"Phân phối có đuôi rất dày (heavy tails), có nhiều outliers tiềm năng.\n\n")
+                f.write(f"Distribution has heavy tails with potential outliers.\n\n")
             else:
-                f.write(f"Phân phối tương đối bình thường hoặc đuôi mỏng.\n\n")
+                f.write(f"Distribution is relatively normal or thin-tailed.\n\n")
                 
     # Plot distributions (using histograms as density plot alternatives)
     plt.figure(figsize=(18, 12))
@@ -209,10 +209,10 @@ def perform_eda():
     
     # Append correlation info to report
     with open(report_path, "a", encoding="utf-8") as f:
-        f.write("## 3. Hệ số tương quan Pearson (tính tại vị trí trung tâm index 50)\n\n")
+        f.write("## 3. Pearson Correlation Coefficients (calculated at center index 50)\n\n")
         f.write(to_markdown_manual(corr_matrix) + "\n\n")
-        f.write("## 4. Đề xuất phương án chuẩn hóa (Feature Scaling):\n\n")
-        f.write("Dựa trên kết quả thống kê và đồ thị phân phối ở trên, chúng ta sẽ phân tích và chọn phương pháp chuẩn hóa phù hợp nhất cho mô hình.\n")
+        f.write("## 4. Proposed Normalization Method (Feature Scaling):\n\n")
+        f.write("Based on the statistics and distribution plots above, we will analyze and select the most appropriate normalization method for the model.\n")
         
     print(f"EDA report successfully saved to {report_path}")
 

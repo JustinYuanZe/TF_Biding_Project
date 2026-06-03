@@ -118,7 +118,7 @@ def extract_features_for_fasta(fasta_path, save_npy_path):
     np.save(save_npy_path, features_arr)
     print(f"Saved {len(sequences)} sequences to {save_npy_path}. Shape: {features_arr.shape}")
     
-    # In ra tỉ lệ NaN
+    # Print NaN ratio
     nan_ratio = np.isnan(features_arr).mean()
     print(f"NaN ratio: {nan_ratio:.2%}")
 
