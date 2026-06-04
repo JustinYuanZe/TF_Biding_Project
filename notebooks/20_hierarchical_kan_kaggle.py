@@ -52,6 +52,7 @@ import os
 import gc
 import copy
 import math
+import torch.nn.functional as F
 import time
 import random
 import warnings
@@ -138,12 +139,12 @@ def auto_detect_dir(target_file, fallback="data/processed"):
 
 
 class Config:
-    """Script 19: G-CMAB Safe Core config."""
+    """Script 20: Hierarchical KAN Architecture config."""
 
     # ── Paths ──
     FASTA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
     SHAPE_DIR = auto_detect_dir("dnashape_sp1.npy", "data/processed")
-    OUTPUT_DIR = "outputs_gcmab_safe"
+    OUTPUT_DIR = "outputs_hierarchical_kan"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
 
@@ -197,26 +198,30 @@ class Config:
 
     # ══════════════════════════════════════════════════════════════════
 
+    # ── Hierarchical Head ──
+    LOSS_ALPHA = 0.5        # Total_Loss = (1-ALPHA)*Binary + ALPHA*Triclass
+    KAN_DEGREE = 4
+    KAN_HIDDEN = 128
+    KAN_LR = 5e-5           # Slower learning rate for high-capacity KAN layers
     # ── Classifier Head ──
-    HEAD_TYPE = "mlp"
+    HEAD_TYPE = "hierarchical_kan"
     HIDDEN_DIM = 256
     FUSION_DROPOUT = 0.5
     HEAD_LR = 2e-4
 
     # ── Loss ──
     LOSS_TYPE = "weighted_ce"
-    LABEL_SMOOTHING = 0.0
+    LABEL_SMOOTHING = 0.05
     NUM_CLASSES = 4
-    WEIGHT_DECAY = 0.1
+    WEIGHT_DECAY = 0.15
 
     # ── Training ──
-    BATCH_SIZE = 16
-    # With 2×T4 Accelerate: effective batch = 16×2 = 32 → no grad accum needed
-    # With 1×T4: keep grad_accum=4 for effective 64
+    BATCH_SIZE = 64
+    # With 2×T4 Accelerate: effective batch = 64×2 = 128
     GRAD_ACCUM_STEPS = 1  # Accelerate handles multi-GPU; set >1 for single GPU if desired
     EPOCHS = 30
     PATIENCE = 12
-    WARMUP_RATIO = 0.15
+    WARMUP_RATIO = 0.25
     MAX_GRAD_NORM = 0.5
 
     # ── Data Split ──
@@ -251,7 +256,7 @@ if torch.cuda.is_available():
 # ── Initialize Accelerator ──
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 accelerator = Accelerator(
-    mixed_precision="bf16",
+    mixed_precision="no",
     gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
     kwargs_handlers=[ddp_kwargs],
 )
@@ -260,7 +265,7 @@ DEVICE = accelerator.device
 if accelerator.is_main_process:
     print(f"\nUsing device: {DEVICE}")
     print(f"Num processes: {accelerator.num_processes}")
-    print(f"Architecture: G-CMAB Safe Core (Script 19)")
+    print(f"Architecture: Hierarchical KAN (Script 20)")
     print(f"  Base: Script 18 (d_model={cfg.CROSS_ATTN_D_MODEL}, 1 cross-attn, weighted-CE)")
     print(f"  Flag 1 — Strided Conv:   {cfg.USE_STRIDED_CONV}")
     print(f"  Flag 2 — GroupNorm:       {cfg.USE_GROUPNORM}")
@@ -843,9 +848,44 @@ class CrossModalAttentionLayer(nn.Module):
         return seq_out, shape_out
 
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# CELL X: Chebyshev KAN Layer
+# ═══════════════════════════════════════════════════════════════════════
+
+class ChebyKANLinear(nn.Module):
+    """
+    Kolmogorov-Arnold Network layer using Chebyshev polynomial basis.
+    """
+    def __init__(self, in_features, out_features, degree=4):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.degree = degree
+
+        self.cheby_coeffs = nn.Parameter(
+            torch.randn(out_features, in_features, degree + 1)
+            * (1.0 / math.sqrt(in_features * (degree + 1)))
+        )
+        self.base_linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        base_output = self.base_linear(x)
+        x_norm = torch.tanh(x)
+
+        T = [torch.ones_like(x_norm)]
+        if self.degree >= 1:
+            T.append(x_norm)
+        for n in range(2, self.degree + 1):
+            T.append(2.0 * x_norm * T[-1] - T[-2])
+
+        cheby_basis = torch.stack(T, dim=-1)
+        kan_output = torch.einsum('bid,oid->bo', cheby_basis, self.cheby_coeffs)
+        return base_output + kan_output
+
 # ---------- Component 4: Main Classifier ----------
 
-class GCMABSafeClassifier(nn.Module):
+class HierarchicalKANModel(nn.Module):
     """
     Script 19: G-CMAB Safe Core Classifier.
     Builds on Script 18 with 4 independently togglable improvements.
@@ -898,13 +938,23 @@ class GCMABSafeClassifier(nn.Module):
             # Original Script 18: mean + mean → 2*d_model
             fusion_dim = d_model * 2
 
-        # Classifier head
-        self.classifier = nn.Sequential(
+        # ── Hierarchical Head ──
+        # Head 1: Binary (Negative vs Positive) - MLP
+        self.binary_head = nn.Sequential(
             nn.LayerNorm(fusion_dim),
-            nn.Linear(fusion_dim, cfg.HIDDEN_DIM),
+            nn.Linear(fusion_dim, 128),
             nn.GELU(),
             nn.Dropout(p=cfg.FUSION_DROPOUT),
-            nn.Linear(cfg.HIDDEN_DIM, cfg.NUM_CLASSES),
+            nn.Linear(128, 2)
+        )
+        
+        # Head 2: Tri-class (SP1 vs SP2 vs SP4) - KAN
+        self.triclass_head = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            ChebyKANLinear(fusion_dim, cfg.KAN_HIDDEN, degree=cfg.KAN_DEGREE),
+            nn.LayerNorm(cfg.KAN_HIDDEN),
+            nn.Dropout(p=cfg.FUSION_DROPOUT),
+            ChebyKANLinear(cfg.KAN_HIDDEN, 3, degree=cfg.KAN_DEGREE)
         )
 
     def _get_bert_features(self, input_ids, attention_mask):
@@ -1027,7 +1077,11 @@ class GCMABSafeClassifier(nn.Module):
             shape_pooled = shape_feats.mean(dim=1)
 
         fused = torch.cat([seq_pooled, shape_pooled], dim=1)
-        return self.classifier(fused)
+        
+        # Hierarchical Classification
+        logits_binary = self.binary_head(fused)
+        logits_triclass = self.triclass_head(fused)
+        return logits_binary, logits_triclass
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 8: Dataset & DataLoaders
@@ -1075,7 +1129,7 @@ if accelerator.is_main_process:
 # CELL 9: Build Model, Optimizer, Loss
 # ═══════════════════════════════════════════════════════════════════════
 
-model = GCMABSafeClassifier(backbone=dnabert_model, cfg=cfg)
+model = HierarchicalKANModel(backbone=dnabert_model, cfg=cfg)
 
 # ── Optimizer with component-specific learning rates ──
 param_groups = []
@@ -1086,7 +1140,8 @@ param_groups.append({"params": backbone_params, "lr": cfg.BACKBONE_LR, "weight_d
 param_groups.append({"params": list(model.seq_projection.parameters()), "lr": cfg.SEQ_PROJ_LR, "weight_decay": cfg.WEIGHT_DECAY})
 param_groups.append({"params": list(model.shape_cnn.parameters()), "lr": cfg.SHAPE_LR, "weight_decay": cfg.WEIGHT_DECAY})
 param_groups.append({"params": list(model.cross_attention_layers.parameters()), "lr": cfg.CROSS_ATTN_LR, "weight_decay": cfg.WEIGHT_DECAY})
-param_groups.append({"params": list(model.classifier.parameters()), "lr": cfg.HEAD_LR, "weight_decay": cfg.WEIGHT_DECAY})
+param_groups.append({"params": list(model.binary_head.parameters()), "lr": cfg.HEAD_LR, "weight_decay": cfg.WEIGHT_DECAY})
+param_groups.append({"params": list(model.triclass_head.parameters()), "lr": cfg.KAN_LR, "weight_decay": cfg.WEIGHT_DECAY})
 
 # Layer-Attention parameters (scalar-mix learns fast → higher LR)
 if cfg.USE_LAYER_ATTN and model.layer_attention is not None:
@@ -1125,7 +1180,7 @@ model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
 trainable_total = sum(p.numel() for g in param_groups for p in g["params"])
 if accelerator.is_main_process:
     print(f"\n{'='*60}")
-    print("MODEL SUMMARY -- G-CMAB Safe Core (Script 19)")
+    print("MODEL SUMMARY -- Hierarchical KAN (Script 20)")
     print(f"{'='*60}")
     print(f"  Trainable params:    {trainable_total:,}")
     print(f"  d_model:             {cfg.CROSS_ATTN_D_MODEL}")
@@ -1161,8 +1216,23 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
 
         with accelerator_obj.accumulate(model):
             with accelerator_obj.autocast():
-                logits = model(input_ids, attention_mask, shape_features)
-                loss = criterion(logits, labels)
+                logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
+                
+                # ── Dual Loss Computation ──
+                # labels: 0=SP1, 1=SP2, 2=SP4, 3=Negative
+                # binary_labels: 1 if Positive (0,1,2), 0 if Negative (3)
+                binary_labels = (labels != 3).long()
+                loss_binary = F.cross_entropy(logits_binary, binary_labels)
+                
+                # Extract positive samples for tri-class head
+                positive_mask = (labels != 3)
+                if positive_mask.sum() > 0:
+                    loss_triclass = F.cross_entropy(logits_triclass[positive_mask], labels[positive_mask], weight=criterion.weight[:3])
+                else:
+                    loss_triclass = torch.tensor(0.0, device=labels.device)
+                
+                # Total Loss with ALPHA
+                loss = (1 - cfg.LOSS_ALPHA) * loss_binary + cfg.LOSS_ALPHA * loss_triclass
 
             accelerator_obj.backward(loss)
 
@@ -1178,7 +1248,15 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
             optimizer.zero_grad()
 
         running_loss += loss.item() * labels.size(0)
-        _, predicted = logits.max(1)
+        
+        # Joint probability prediction for train accuracy calculation
+        probs_binary = torch.softmax(logits_binary.detach().float(), dim=1)
+        probs_triclass = torch.softmax(logits_triclass.detach().float(), dim=1)
+        probs = torch.zeros(labels.size(0), 4, device=labels.device)
+        probs[:, 3] = probs_binary[:, 0]
+        for i in range(3):
+            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
+        predicted = probs.argmax(dim=1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         if accelerator_obj.is_main_process:
@@ -1207,11 +1285,29 @@ def evaluate(model, loader, criterion, accelerator_obj):
         shape_features = batch["shape_features"]
         labels = batch["labels"]
         with accelerator_obj.autocast():
-            logits = model(input_ids, attention_mask, shape_features)
-            loss = criterion(logits, labels)
+            logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
+            
+            binary_labels = (labels != 3).long()
+            loss_binary = F.cross_entropy(logits_binary, binary_labels)
+            
+            positive_mask = (labels != 3)
+            if positive_mask.sum() > 0:
+                loss_triclass = F.cross_entropy(logits_triclass[positive_mask], labels[positive_mask], weight=criterion.weight[:3])
+            else:
+                loss_triclass = torch.tensor(0.0, device=labels.device)
+            
+            loss = (1 - cfg.LOSS_ALPHA) * loss_binary + cfg.LOSS_ALPHA * loss_triclass
+
+        # Joint Probabilities
+        probs_binary = torch.softmax(logits_binary.float(), dim=1)
+        probs_triclass = torch.softmax(logits_triclass.float(), dim=1)
+        probs = torch.zeros(input_ids.size(0), 4, device=input_ids.device)
+        probs[:, 3] = probs_binary[:, 0]
+        for i in range(3):
+            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
+        preds = probs.argmax(dim=1)
 
         # Gather predictions across GPUs for correct accuracy
-        preds = logits.argmax(dim=1)
         preds, labels_gathered = accelerator_obj.gather_for_metrics((preds, labels))
         loss_gathered = accelerator_obj.gather_for_metrics(loss.repeat(labels.size(0)))
 
@@ -1226,7 +1322,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                 criterion, accelerator_obj, cfg):
     if accelerator_obj.is_main_process:
         print("\n" + "=" * 60)
-        print("TRAINING -- G-CMAB Safe Core (Script 19)")
+        print("TRAINING -- Hierarchical KAN (Script 20)")
         print("=" * 60)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -1252,6 +1348,10 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
+        # 1. Đồng bộ hóa trước khi in ấn và lưu checkpoint (tránh lệch pha đọc/ghi model parameters)
+        accelerator_obj.wait_for_everyone()
+
+        # 2. In ấn kết quả (chỉ chạy trên main process)
         if accelerator_obj.is_main_process:
             print(
                 f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
@@ -1259,16 +1359,17 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                 f"Val: {val_loss:.4f}/{val_acc:.4f} | "
                 f"Gap: {gap:.2%} | LR: {optimizer.param_groups[0]['lr']:.1e} | {elapsed:.0f}s"
             )
-
             if epoch >= 3 and max(history["val_acc"]) < 0.30:
                 print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")
 
-            if val_acc > best_val_acc:
-                best_val_loss = val_loss
-                best_val_acc = val_acc
-                patience_counter = 0
-                # Save with accelerator (handles DDP unwrapping)
-                accelerator_obj.wait_for_everyone()
+        # 3. Cập nhật patience và quyết định early stopping trên mọi GPU (đồng bộ cờ dừng)
+        if val_acc > best_val_acc:
+            best_val_loss = val_loss
+            best_val_acc = val_acc
+            patience_counter = 0
+            
+            # Chỉ GPU 0 thực hiện ghi file checkpoint xuống đĩa
+            if accelerator_obj.is_main_process:
                 unwrapped = accelerator_obj.unwrap_model(model)
                 torch.save({
                     "epoch": epoch + 1,
@@ -1283,11 +1384,15 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                     },
                 }, os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt"))
                 print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap:.2%})")
-            else:
-                patience_counter += 1
-                if patience_counter >= cfg.PATIENCE:
+        else:
+            patience_counter += 1
+            if patience_counter >= cfg.PATIENCE:
+                if accelerator_obj.is_main_process:
                     print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
-                    break
+                break
+
+        # 4. Đồng bộ hóa sau khi ghi checkpoint (để GPU 1 đợi GPU 0 hoàn tất ghi file trước khi sang epoch tiếp theo)
+        accelerator_obj.wait_for_everyone()
 
     if accelerator_obj.is_main_process:
         print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
@@ -1320,9 +1425,19 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
         shape_features = batch["shape_features"]
         labels = batch["labels"]
         with accelerator_obj.autocast():
-            logits = model(input_ids, attention_mask, shape_features)
-        probs = torch.softmax(logits.float(), dim=1)
-        preds = logits.argmax(dim=1)
+            logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
+        
+        # Probabilities
+        probs_binary = torch.softmax(logits_binary.float(), dim=1)
+        probs_triclass = torch.softmax(logits_triclass.float(), dim=1)
+        
+        # Joint Probabilities
+        probs = torch.zeros(input_ids.size(0), 4, device=input_ids.device)
+        probs[:, 3] = probs_binary[:, 0]  # P(Negative)
+        for i in range(3):
+            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]  # P(Positive) * P(SP_i | Positive)
+            
+        preds = probs.argmax(dim=1)
 
         preds_g, labels_g, probs_g = accelerator_obj.gather_for_metrics((preds, labels, probs))
         all_preds.extend(preds_g.cpu().numpy())
@@ -1342,7 +1457,7 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
 
         report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
         with open(report_path, "w") as f:
-            f.write("CLASSIFICATION REPORT -- G-CMAB Safe Core (Script 19)\n")
+            f.write("CLASSIFICATION REPORT -- Hierarchical KAN (Script 20)\n")
             f.write("=" * 60 + "\n")
             f.write(report_str)
         print(f"  -> Report saved: {report_path}")
@@ -1396,7 +1511,7 @@ if accelerator.is_main_process:
 # CELL 12: Generate All Performance Figures (main process only)
 # ═══════════════════════════════════════════════════════════════════════
 
-TITLE_PREFIX = "G-CMAB Safe Core (DNABERT-2 + DNAshape)"
+TITLE_PREFIX = "Hierarchical KAN (FP32 - Split LR)"
 
 def plot_training_curves(history, save_dir):
     epochs = len(history["train_loss"])

@@ -43,7 +43,7 @@ if n_gpus >= 2:
         "accelerate", "launch",
         "--multi_gpu",
         f"--num_processes={n_gpus}",
-        "--mixed_precision=fp16",
+        "--mixed_precision=bf16",
         "notebooks/19_gcmab_safe_kaggle.py",
     ], check=True)
 else:
@@ -52,6 +52,6 @@ else:
     subprocess.run([
         "accelerate", "launch",
         "--num_processes=1",
-        "--mixed_precision=fp16",
+        "--mixed_precision=bf16",
         "notebooks/19_gcmab_safe_kaggle.py",
     ], check=True)
