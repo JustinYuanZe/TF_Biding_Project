@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-Script 19/20: G-CMAB Safe Core — Incremental Improvements on Script 18 Baseline
+Script 19: G-CMAB Safe Core — Incremental Improvements on Script 18 Baseline
 Designed for: Kaggle GPU (1×T4 or 2×T4 via HuggingFace Accelerate)
 Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
-"""
 
-# Suppress Hugging Face warnings and tokenizers parallelism messages
-import os
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+BUILD PHILOSOPHY (Lessons from Scripts 15→18):
+  - Script 16 collapsed to 25% by changing 11 things at once.
+  - Each improvement here is an independent flag — test one at a time.
+  - Keep Script 18 core (d_model=128, 1 cross-attn, weighted-CE, no pos-embed/EMA).
+
+SAFE IMPROVEMENTS (4 flags):
+  1. USE_STRIDED_CONV = True   — Strided Conv replaces MaxPool in shape CNN
+  2. USE_GROUPNORM   = True   — GroupNorm replaces BatchNorm (multi-GPU safe)
+  3. USE_LAYER_ATTN  = True   — Scalar-mix over multiple BERT layers (ELMo-style)
+  4. USE_MULTI_POOL  = True   — seq: mean‖max pooling, shape: K-Max(k=4) pooling
+
+Multi-GPU via HuggingFace Accelerate (automatic, no code change needed for 1-GPU).
+"""
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 0: Install Dependencies
@@ -26,15 +34,13 @@ def install_packages():
         "accelerate>=0.25.0",
         "safetensors>=0.4.0",
     ]
-    # Only run pip install on local rank 0 to avoid race conditions
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        for pkg in packages:
-            try:
-                pkg_name = pkg.split(">=")[0].split("==")[0]
-                __import__(pkg_name)
-            except ImportError:
-                print(f"Installing {pkg}...")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+    for pkg in packages:
+        try:
+            pkg_name = pkg.split(">=")[0].split("==")[0]
+            __import__(pkg_name)
+        except ImportError:
+            print(f"Installing {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 install_packages()
 
@@ -42,11 +48,9 @@ install_packages()
 # CELL 1: Imports
 # ═══════════════════════════════════════════════════════════════════════
 
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-from huggingface_hub.utils import disable_progress_bars
-disable_progress_bars()
+import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import gc
 import copy
@@ -82,9 +86,18 @@ from sklearn.preprocessing import label_binarize
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from tqdm import tqdm
 
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 # ── HuggingFace Accelerate ──
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 2: Configuration
@@ -125,12 +138,12 @@ def auto_detect_dir(target_file, fallback="data/processed"):
 
 
 class Config:
-    """Script 20: Hierarchical KAN Architecture config."""
+    """Script 19: G-CMAB Safe Core config."""
 
     # ── Paths ──
     FASTA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
     SHAPE_DIR = auto_detect_dir("dnashape_sp1.npy", "data/processed")
-    OUTPUT_DIR = "outputs_hierarchical_kan"
+    OUTPUT_DIR = "outputs_gcmab_safe"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
 
@@ -163,6 +176,10 @@ class Config:
     SHAPE_CONV_CHANNELS = [32, 64, 128]
     SHAPE_LR = 3e-4
 
+    # ══════════════════════════════════════════════════════════════════
+    # SCRIPT 19 FLAGS — each toggleable independently for ablation
+    # ══════════════════════════════════════════════════════════════════
+
     # Flag 1: Strided Conv replaces MaxPool in shape CNN
     USE_STRIDED_CONV = True
 
@@ -178,30 +195,29 @@ class Config:
     USE_MULTI_POOL = True
     KMAX_K = 4
 
-    # ── Hierarchical Head ──
-    LOSS_ALPHA = 0.5        # Total_Loss = (1-ALPHA)*Binary + ALPHA*Triclass
-    KAN_DEGREE = 4
-    KAN_HIDDEN = 128
-    KAN_LR = 5e-5           # Slower learning rate for high-capacity KAN layers
+    # ══════════════════════════════════════════════════════════════════
+
     # ── Classifier Head ──
-    HEAD_TYPE = "hierarchical_kan"
+    HEAD_TYPE = "mlp"
     HIDDEN_DIM = 256
     FUSION_DROPOUT = 0.5
     HEAD_LR = 2e-4
 
     # ── Loss ──
     LOSS_TYPE = "weighted_ce"
-    LABEL_SMOOTHING = 0.05
+    LABEL_SMOOTHING = 0.0
     NUM_CLASSES = 4
-    WEIGHT_DECAY = 0.15
+    WEIGHT_DECAY = 0.1
 
     # ── Training ──
-    BATCH_SIZE = 64
-    GRAD_ACCUM_STEPS = 1
+    BATCH_SIZE = 16
+    # With 2×T4 Accelerate: effective batch = 16×2 = 32 → no grad accum needed
+    # With 1×T4: keep grad_accum=4 for effective 64
+    GRAD_ACCUM_STEPS = 1  # Accelerate handles multi-GPU; set >1 for single GPU if desired
     EPOCHS = 30
     PATIENCE = 12
     MAX_OVERFITTING_GAP = 30.0  # Max train-val gap (%) to prevent severe overfitting
-    WARMUP_RATIO = 0.25
+    WARMUP_RATIO = 0.15
     MAX_GRAD_NORM = 0.5
 
     # ── Data Split ──
@@ -236,20 +252,31 @@ if torch.cuda.is_available():
 # ── Initialize Accelerator ──
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 accelerator = Accelerator(
-    mixed_precision="no",
+    mixed_precision="bf16",
     gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
     kwargs_handlers=[ddp_kwargs],
 )
 DEVICE = accelerator.device
 
-# Override print for non-main processes globally
+# Redefine print globally to suppress non-main process logging in DDP/Multi-GPU
 if not accelerator.is_main_process:
     import builtins
     builtins.print = lambda *args, **kwargs: None
 
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    try:
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    except AttributeError:
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    n_gpus = torch.cuda.device_count()
+    print(f"Number of GPUs: {n_gpus}")
+
 print(f"\nUsing device: {DEVICE}")
 print(f"Num processes: {accelerator.num_processes}")
-print(f"Architecture: Hierarchical KAN (Script 20)")
+print(f"Architecture: G-CMAB Safe Core (Script 19)")
 print(f"  Base: Script 18 (d_model={cfg.CROSS_ATTN_D_MODEL}, 1 cross-attn, weighted-CE)")
 print(f"  Flag 1 — Strided Conv:   {cfg.USE_STRIDED_CONV}")
 print(f"  Flag 2 — GroupNorm:       {cfg.USE_GROUPNORM}")
@@ -299,7 +326,8 @@ def load_shape_features(data_dir, shape_files):
             break
     if not neg_shape_path:
         raise FileNotFoundError("Could not find any negative DNAshape file among candidates.")
-    print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
+    if accelerator.is_main_process:
+        print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
 
     resolved_paths = {}
     for cls_name, fname in shape_files.items():
@@ -313,7 +341,8 @@ def load_shape_features(data_dir, shape_files):
 
     for cls_name, fpath in resolved_paths.items():
         shape_data = np.load(fpath)
-        print(f"  {cls_name} shape: {shape_data.shape} ({os.path.basename(fpath)})")
+        if accelerator.is_main_process:
+            print(f"  {cls_name} shape: {shape_data.shape} ({os.path.basename(fpath)})")
         all_shapes.append(shape_data)
 
     return np.concatenate(all_shapes, axis=0)
@@ -321,9 +350,10 @@ def load_shape_features(data_dir, shape_files):
 
 def load_all_data(fasta_dir, shape_dir, shape_files):
     """Load all 4 classes: sequences + shape features + group-aware labels."""
-    print("=" * 60)
-    print("LOADING DATASETS (Sequences + DNAshape Features)")
-    print("=" * 60)
+    if accelerator.is_main_process:
+        print("=" * 60)
+        print("LOADING DATASETS (Sequences + DNAshape Features)")
+        print("=" * 60)
 
     neg_fasta_path = None
     fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
@@ -334,7 +364,8 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
             break
     if not neg_fasta_path:
         raise FileNotFoundError("Could not find any negative FASTA file among candidates.")
-    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
+    if accelerator.is_main_process:
+        print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
 
     fasta_files = {
         "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
@@ -351,7 +382,8 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
 
     for cls_idx, (cls_name, fpath) in enumerate(fasta_files.items()):
         seqs, hdrs = load_fasta(fpath)
-        print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
+        if accelerator.is_main_process:
+            print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
         all_sequences.extend(seqs)
         all_headers.extend(hdrs)
         all_labels.extend([cls_idx] * len(seqs))
@@ -368,24 +400,27 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     all_labels = np.array(all_labels)
     all_groups = np.array(all_groups)
 
-    print("\n  Loading DNAshape features...")
+    if accelerator.is_main_process:
+        print("\n  Loading DNAshape features...")
     all_shapes = load_shape_features(shape_dir, shape_files)
 
     assert len(all_sequences) == all_shapes.shape[0], (
         f"Sequence count ({len(all_sequences)}) != shape count ({all_shapes.shape[0]})"
     )
 
-    print(f"\n  Total: {len(all_sequences)} sequences, {group_id} groups")
-    print(f"  Shape features: {all_shapes.shape}")
-    print(f"  Class distribution: {np.bincount(all_labels)}")
+    if accelerator.is_main_process:
+        print(f"\n  Total: {len(all_sequences)} sequences, {group_id} groups")
+        print(f"  Shape features: {all_shapes.shape}")
+        print(f"  Class distribution: {np.bincount(all_labels)}")
     return all_sequences, all_labels, all_groups, all_shapes, all_headers
 
 
 def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=42):
     """Group-aware train/test split (no revcomp leakage)."""
-    print("\n" + "=" * 60)
-    print("SPLITTING DATA (GroupShuffleSplit — no revcomp leakage)")
-    print("=" * 60)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("SPLITTING DATA (GroupShuffleSplit — no revcomp leakage)")
+        print("=" * 60)
 
     gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
     train_idx, test_idx = next(gss.split(sequences, labels, groups))
@@ -397,10 +432,11 @@ def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=4
     headers_train = [headers[i] for i in train_idx]
     headers_test = [headers[i] for i in test_idx]
 
-    print(f"  Train: {len(seq_train)} sequences")
-    print(f"  Test:  {len(seq_test)} sequences")
-    print(f"  Train class dist: {np.bincount(y_train)}")
-    print(f"  Test  class dist: {np.bincount(y_test)}")
+    if accelerator.is_main_process:
+        print(f"  Train: {len(seq_train)} sequences")
+        print(f"  Test:  {len(seq_test)} sequences")
+        print(f"  Train class dist: {np.bincount(y_train)}")
+        print(f"  Test  class dist: {np.bincount(y_test)}")
     return seq_train, seq_test, y_train, y_test, shape_train, shape_test, headers_train, headers_test
 
 
@@ -420,9 +456,10 @@ gc.collect()
 
 def robust_normalize_shapes(shape_train, shape_test):
     """Apply Robust Scaler normalization per channel. Stats from TRAINING SET ONLY."""
-    print("\n" + "=" * 60)
-    print("NORMALIZING DNAshape FEATURES (Robust Scaler P1-P99)")
-    print("=" * 60)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("NORMALIZING DNAshape FEATURES (Robust Scaler P1-P99)")
+        print("=" * 60)
 
     n_channels = shape_train.shape[1]
     channel_names = ["MGW", "ProT", "Roll", "HelT", "EP"]
@@ -437,15 +474,17 @@ def robust_normalize_shapes(shape_train, shape_test):
         scale = max(p99_val - p1_val, 1e-9)
         shape_train_norm[:, ch, :] = (shape_train_norm[:, ch, :] - median_val) / scale
         shape_test_norm[:, ch, :] = (shape_test_norm[:, ch, :] - median_val) / scale
-        print(f"  {channel_names[ch]:>5s}: median={median_val:>8.4f}, "
-              f"P1={p1_val:>8.4f}, P99={p99_val:>8.4f}, scale={scale:>8.4f}")
+        if accelerator.is_main_process:
+            print(f"  {channel_names[ch]:>5s}: median={median_val:>8.4f}, "
+                  f"P1={p1_val:>8.4f}, P99={p99_val:>8.4f}, scale={scale:>8.4f}")
 
     nan_train = np.isnan(shape_train_norm).sum()
     nan_test = np.isnan(shape_test_norm).sum()
     shape_train_norm = np.nan_to_num(shape_train_norm, nan=0.0)
     shape_test_norm = np.nan_to_num(shape_test_norm, nan=0.0)
-    print(f"\n  NaN filled with 0: train={nan_train}, test={nan_test}")
-    print(f"  Train shape range: [{shape_train_norm.min():.4f}, {shape_train_norm.max():.4f}]")
+    if accelerator.is_main_process:
+        print(f"\n  NaN filled with 0: train={nan_train}, test={nan_test}")
+        print(f"  Train shape range: [{shape_train_norm.min():.4f}, {shape_train_norm.max():.4f}]")
     return shape_train_norm, shape_test_norm
 
 
@@ -513,8 +552,9 @@ def patch_flash_attention():
                 if hasattr(mod, attr_name):
                     setattr(mod, attr_name, replacement)
                     patched += 1
-    print(f"  Patched {patched} flash-attention refs -> pure PyTorch."
-          if patched else "  No flash-attn refs to patch.")
+    if accelerator.is_main_process:
+        print(f"  Patched {patched} flash-attention refs -> pure PyTorch."
+              if patched else "  No flash-attn refs to patch.")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 6: Load DNABERT-2 Backbone (with Selective Unfreezing)
@@ -524,9 +564,10 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
     """Load DNABERT-2 with selective layer unfreezing.
     Returns model on CPU — Accelerate will handle device placement.
     """
-    print("\n" + "=" * 60)
-    print("LOADING DNABERT-2 BACKBONE (Selective Fine-Tuning)")
-    print("=" * 60)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("LOADING DNABERT-2 BACKBONE (Selective Fine-Tuning)")
+        print("=" * 60)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
@@ -548,15 +589,18 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
         for name, buf in model.named_buffers():
             if buf.device == torch.device("meta"):
                 raise RuntimeError(f"Buffer {name} on meta device")
-        print("  Strategy 1 (direct load) OK")
+        if accelerator.is_main_process:
+            print("  Strategy 1 (direct load) OK")
     except Exception as e:
-        print(f"  Strategy 1 failed: {e}")
+        if accelerator.is_main_process:
+            print(f"  Strategy 1 failed: {e}")
         model = None
 
     # Strategy 2: Empty init + manual state_dict
     if model is None:
         try:
-            print("  Trying Strategy 2 (empty init + state_dict)...")
+            if accelerator.is_main_process:
+                print("  Trying Strategy 2 (empty init + state_dict)...")
             from huggingface_hub import hf_hub_download
             with torch.no_grad():
                 model = AutoModel.from_config(config, trust_remote_code=True)
@@ -573,15 +617,18 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
                 if ck in set(result.missing_keys):
                     raise RuntimeError(f"Core weight '{ck}' missing!")
             model = model.to("cpu")
-            print("  Strategy 2 OK")
+            if accelerator.is_main_process:
+                print("  Strategy 2 OK")
         except Exception as e:
-            print(f"  Strategy 2 failed: {e}")
+            if accelerator.is_main_process:
+                print(f"  Strategy 2 failed: {e}")
             model = None
 
     # Strategy 3: Monkey-patch torch.empty meta->cpu
     if model is None:
         try:
-            print("  Trying Strategy 3 (monkey-patch ALiBi)...")
+            if accelerator.is_main_process:
+                print("  Trying Strategy 3 (monkey-patch ALiBi)...")
             _orig = torch.empty
             def _patched(*a, **kw):
                 if kw.get("device") == torch.device("meta") or str(kw.get("device", "")) == "meta":
@@ -592,7 +639,8 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
                 model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=True, low_cpu_mem_usage=False)
             finally:
                 torch.empty = _orig
-            print("  Strategy 3 OK")
+            if accelerator.is_main_process:
+                print("  Strategy 3 OK")
         except Exception as e:
             raise RuntimeError(f"All loading strategies failed: {e}") from e
 
@@ -611,12 +659,13 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n  DNABERT-2 loaded")
-    print(f"  Total encoder layers: {total_layers}")
-    print(f"  Frozen: layers 0-{unfreeze_from-1} | Unfrozen: layers {unfreeze_from}-{total_layers-1} ({unfreeze_last_n})")
-    print(f"  Total: {total_params:,} | Trainable: {trainable:,} ({100*trainable/total_params:.1f}%)")
-    if cfg.USE_LAYER_ATTN:
-        print(f"  Layer-Attention: mixing last {cfg.LAYER_ATTN_N} hidden states")
+    if accelerator.is_main_process:
+        print(f"\n  DNABERT-2 loaded")
+        print(f"  Total encoder layers: {total_layers}")
+        print(f"  Frozen: layers 0-{unfreeze_from-1} | Unfrozen: layers {unfreeze_from}-{total_layers-1} ({unfreeze_last_n})")
+        print(f"  Total: {total_params:,} | Trainable: {trainable:,} ({100*trainable/total_params:.1f}%)")
+        if cfg.USE_LAYER_ATTN:
+            print(f"  Layer-Attention: mixing last {cfg.LAYER_ATTN_N} hidden states")
     return model, tokenizer
 
 
@@ -633,13 +682,14 @@ def compute_max_token_length(sequences, tok, sample_size=2000, percentile=99, fl
     lengths = [len(tok(s, add_special_tokens=True)["input_ids"]) for s in sample]
     p_val = int(np.percentile(lengths, percentile))
     chosen = int(max(floor, min(cap, p_val + 2)))
-    print("\n" + "=" * 60)
-    print("AUTO MAX TOKEN LENGTH")
-    print("=" * 60)
-    print(f"  Token length (sample n={len(sample)}): "
-          f"min={min(lengths)}, mean={np.mean(lengths):.1f}, "
-          f"p{percentile}={p_val}, max={max(lengths)}")
-    print(f"  Chosen MAX_TOKEN_LENGTH = {chosen}")
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("AUTO MAX TOKEN LENGTH")
+        print("=" * 60)
+        print(f"  Token length (sample n={len(sample)}): "
+              f"min={min(lengths)}, mean={np.mean(lengths):.1f}, "
+              f"p{percentile}={p_val}, max={max(lengths)}")
+        print(f"  Chosen MAX_TOKEN_LENGTH = {chosen}")
     return chosen
 
 if cfg.AUTO_MAX_LENGTH:
@@ -649,7 +699,8 @@ if cfg.AUTO_MAX_LENGTH:
     )
 else:
     MAX_LENGTH = cfg.MAX_TOKEN_LENGTH
-    print(f"\n  Using fixed MAX_TOKEN_LENGTH = {MAX_LENGTH}")
+    if accelerator.is_main_process:
+        print(f"\n  Using fixed MAX_TOKEN_LENGTH = {MAX_LENGTH}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 7: Architecture — G-CMAB Safe Core
@@ -808,43 +859,11 @@ class CrossModalAttentionLayer(nn.Module):
         return seq_out, shape_out
 
 
-# ---------- Chebyshev KAN Layer ----------
-
-class ChebyKANLinear(nn.Module):
-    """
-    Kolmogorov-Arnold Network layer using Chebyshev polynomial basis.
-    """
-    def __init__(self, in_features, out_features, degree=4):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.degree = degree
-
-        self.cheby_coeffs = nn.Parameter(
-            torch.randn(out_features, in_features, degree + 1)
-            * (1.0 / math.sqrt(in_features * (degree + 1)))
-        )
-        self.base_linear = nn.Linear(in_features, out_features)
-
-    def forward(self, x):
-        base_output = self.base_linear(x)
-        x_norm = torch.tanh(x)
-
-        T = [torch.ones_like(x_norm)]
-        if self.degree >= 1:
-            T.append(x_norm)
-        for n in range(2, self.degree + 1):
-            T.append(2.0 * x_norm * T[-1] - T[-2])
-
-        cheby_basis = torch.stack(T, dim=-1)
-        kan_output = torch.einsum('bid,oid->bo', cheby_basis, self.cheby_coeffs)
-        return base_output + kan_output
-
 # ---------- Component 4: Main Classifier ----------
 
-class HierarchicalKANModel(nn.Module):
+class GCMABSafeClassifier(nn.Module):
     """
-    Script 19/20: G-CMAB Safe Core Classifier.
+    Script 19: G-CMAB Safe Core Classifier.
     Builds on Script 18 with 4 independently togglable improvements.
     """
     def __init__(self, backbone, cfg):
@@ -895,23 +914,13 @@ class HierarchicalKANModel(nn.Module):
             # Original Script 18: mean + mean → 2*d_model
             fusion_dim = d_model * 2
 
-        # ── Hierarchical Head ──
-        # Head 1: Binary (Negative vs Positive) - MLP
-        self.binary_head = nn.Sequential(
+        # Classifier head
+        self.classifier = nn.Sequential(
             nn.LayerNorm(fusion_dim),
-            nn.Linear(fusion_dim, 128),
+            nn.Linear(fusion_dim, cfg.HIDDEN_DIM),
             nn.GELU(),
             nn.Dropout(p=cfg.FUSION_DROPOUT),
-            nn.Linear(128, 2)
-        )
-
-        # Head 2: Tri-class (SP1 vs SP2 vs SP4) - KAN
-        self.triclass_head = nn.Sequential(
-            nn.LayerNorm(fusion_dim),
-            ChebyKANLinear(fusion_dim, cfg.KAN_HIDDEN, degree=cfg.KAN_DEGREE),
-            nn.LayerNorm(cfg.KAN_HIDDEN),
-            nn.Dropout(p=cfg.FUSION_DROPOUT),
-            ChebyKANLinear(cfg.KAN_HIDDEN, 3, degree=cfg.KAN_DEGREE)
+            nn.Linear(cfg.HIDDEN_DIM, cfg.NUM_CLASSES),
         )
 
     def _get_bert_features(self, input_ids, attention_mask):
@@ -932,10 +941,12 @@ class HierarchicalKANModel(nn.Module):
                     return self.layer_attention(selected)
                 else:
                     # Fallback: hidden_states not available in output
-                    print("  [LayerAttn] WARNING: hidden_states not in output, using hook fallback...")
+                    if accelerator.is_main_process:
+                        print("  [LayerAttn] WARNING: hidden_states not in output, using hook fallback...")
                     self._layer_attn_fallback = True
             except Exception as e:
-                print(f"  [LayerAttn] WARNING: output_hidden_states failed ({e}), using hook fallback...")
+                if accelerator.is_main_process:
+                    print(f"  [LayerAttn] WARNING: output_hidden_states failed ({e}), using hook fallback...")
                 self._layer_attn_fallback = True
 
         if self.use_layer_attn and getattr(self, '_layer_attn_fallback', False):
@@ -947,6 +958,7 @@ class HierarchicalKANModel(nn.Module):
 
             def make_hook(storage):
                 def hook_fn(module, input, output):
+                    # output is typically (hidden_states, ...) or just hidden_states
                     if isinstance(output, tuple):
                         storage.append(output[0])
                     else:
@@ -984,18 +996,24 @@ class HierarchicalKANModel(nn.Module):
     def _masked_max_pool(self, features, attention_mask):
         """Masked max pooling over sequence dimension."""
         mask_expanded = attention_mask.unsqueeze(-1).float()
+        # Set padding positions to very large negative number
         features_masked = features.clone()
         features_masked[mask_expanded.squeeze(-1) == 0] = -1e9
         return features_masked.max(dim=1)[0]
 
     def _kmax_pool(self, features, k=4):
-        """K-Max pooling: average of top-k values along sequence dim, per feature."""
+        """K-Max pooling: average of top-k values along sequence dim, per feature.
+        More robust than pure Max (which is k=1) — captures top structural peaks
+        without being dominated by a single outlier.
+        """
+        # features: [B, L, D]
         k_actual = min(k, features.size(1))
+        # topk along dim=1
         topk_vals, _ = features.topk(k_actual, dim=1)  # [B, k, D]
         return topk_vals.mean(dim=1)  # [B, D]
 
     def forward(self, input_ids, attention_mask, shape_features):
-        # ── BERT feature extraction ──
+        # ── BERT feature extraction (with optional Layer-Attention) ──
         hidden_states = self._get_bert_features(input_ids, attention_mask)  # [B, T, 768]
         seq_features = self.seq_projection(hidden_states)  # [B, T, d_model]
 
@@ -1011,21 +1029,21 @@ class HierarchicalKANModel(nn.Module):
 
         # ── Pooling (Flag 4) ──
         if self.use_multi_pool:
+            # Seq: concat[masked_mean, masked_max] → 2*d_model
             seq_mean = self._masked_mean_pool(seq_features, attention_mask)
             seq_max = self._masked_max_pool(seq_features, attention_mask)
             seq_pooled = torch.cat([seq_mean, seq_max], dim=1)
+
+            # Shape: K-Max pooling → d_model
             shape_pooled = self._kmax_pool(shape_feats, k=self.kmax_k)
         else:
+            # Script 18 default
             mask_expanded = attention_mask.unsqueeze(-1).float()
             seq_pooled = (seq_features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
             shape_pooled = shape_feats.mean(dim=1)
 
         fused = torch.cat([seq_pooled, shape_pooled], dim=1)
-
-        # Hierarchical Classification
-        logits_binary = self.binary_head(fused)
-        logits_triclass = self.triclass_head(fused)
-        return logits_binary, logits_triclass
+        return self.classifier(fused)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 8: Dataset & DataLoaders
@@ -1065,27 +1083,28 @@ train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True
 test_loader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE * 2, shuffle=False,
                          num_workers=2, pin_memory=True)
 
-print(f"\nDataLoaders ready: {len(train_loader)} train batches, {len(test_loader)} test batches")
-print(f"Sequence max_length = {MAX_LENGTH}")
+if accelerator.is_main_process:
+    print(f"\nDataLoaders ready: {len(train_loader)} train batches, {len(test_loader)} test batches")
+    print(f"Sequence max_length = {MAX_LENGTH}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 9: Build Model, Optimizer, Loss
 # ═══════════════════════════════════════════════════════════════════════
 
-model = HierarchicalKANModel(backbone=dnabert_model, cfg=cfg)
+model = GCMABSafeClassifier(backbone=dnabert_model, cfg=cfg)
 
 # ── Optimizer with component-specific learning rates ──
 param_groups = []
+
 backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
 param_groups.append({"params": backbone_params, "lr": cfg.BACKBONE_LR, "weight_decay": cfg.WEIGHT_DECAY})
 
 param_groups.append({"params": list(model.seq_projection.parameters()), "lr": cfg.SEQ_PROJ_LR, "weight_decay": cfg.WEIGHT_DECAY})
 param_groups.append({"params": list(model.shape_cnn.parameters()), "lr": cfg.SHAPE_LR, "weight_decay": cfg.WEIGHT_DECAY})
 param_groups.append({"params": list(model.cross_attention_layers.parameters()), "lr": cfg.CROSS_ATTN_LR, "weight_decay": cfg.WEIGHT_DECAY})
-param_groups.append({"params": list(model.binary_head.parameters()), "lr": cfg.HEAD_LR, "weight_decay": cfg.WEIGHT_DECAY})
-param_groups.append({"params": list(model.triclass_head.parameters()), "lr": cfg.KAN_LR, "weight_decay": cfg.WEIGHT_DECAY})
+param_groups.append({"params": list(model.classifier.parameters()), "lr": cfg.HEAD_LR, "weight_decay": cfg.WEIGHT_DECAY})
 
-# Layer-Attention parameters
+# Layer-Attention parameters (scalar-mix learns fast → higher LR)
 if cfg.USE_LAYER_ATTN and model.layer_attention is not None:
     param_groups.append({"params": list(model.layer_attention.parameters()), "lr": cfg.LAYER_ATTN_LR, "weight_decay": 0.0})
 
@@ -1103,36 +1122,38 @@ def lr_lambda(current_step):
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-# Class weights
+# Class weights for CrossEntropy Loss
 class_counts = np.bincount(y_train)
 class_weights = len(y_train) / (len(class_counts) * class_counts.astype(np.float32))
-class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=accelerator.device)
 
-print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(len(class_counts))]))
+if accelerator.is_main_process:
+    print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(len(class_counts))]))
 
 criterion = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=cfg.LABEL_SMOOTHING)
 
-# ── Prepare with Accelerate ──
+# ── Prepare with Accelerate (handles DDP, AMP, device placement) ──
 model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, test_loader, scheduler
 )
 
 # Model summary
 trainable_total = sum(p.numel() for g in param_groups for p in g["params"])
-print(f"\n{'='*60}")
-print("MODEL SUMMARY -- Hierarchical KAN (Script 20)")
-print(f"{'='*60}")
-print(f"  Trainable params:    {trainable_total:,}")
-print(f"  d_model:             {cfg.CROSS_ATTN_D_MODEL}")
-print(f"  Backbone LR:         {cfg.BACKBONE_LR}")
-print(f"  Head LR:             {cfg.HEAD_LR}")
-print(f"  Flag 1 Strided Conv: {cfg.USE_STRIDED_CONV}")
-print(f"  Flag 2 GroupNorm:    {cfg.USE_GROUPNORM}")
-print(f"  Flag 3 LayerAttn:   {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N}, LR={cfg.LAYER_ATTN_LR})")
-print(f"  Flag 4 MultiPool:   {cfg.USE_MULTI_POOL} (kmax_k={cfg.KMAX_K})")
-print(f"  Effective batch:     {cfg.BATCH_SIZE}×{accelerator.num_processes} = {cfg.BATCH_SIZE * accelerator.num_processes}")
-print(f"  Grad accum steps:    {cfg.GRAD_ACCUM_STEPS}")
-print(f"  Total / warmup:      {total_steps} / {warmup_steps}")
+if accelerator.is_main_process:
+    print(f"\n{'='*60}")
+    print("MODEL SUMMARY -- G-CMAB Safe Core (Script 19)")
+    print(f"{'='*60}")
+    print(f"  Trainable params:    {trainable_total:,}")
+    print(f"  d_model:             {cfg.CROSS_ATTN_D_MODEL}")
+    print(f"  Backbone LR:         {cfg.BACKBONE_LR}")
+    print(f"  Head LR:             {cfg.HEAD_LR}")
+    print(f"  Flag 1 Strided Conv: {cfg.USE_STRIDED_CONV}")
+    print(f"  Flag 2 GroupNorm:    {cfg.USE_GROUPNORM}")
+    print(f"  Flag 3 LayerAttn:   {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N}, LR={cfg.LAYER_ATTN_LR})")
+    print(f"  Flag 4 MultiPool:   {cfg.USE_MULTI_POOL} (kmax_k={cfg.KMAX_K})")
+    print(f"  Effective batch:     {cfg.BATCH_SIZE}×{accelerator.num_processes} = {cfg.BATCH_SIZE * accelerator.num_processes}")
+    print(f"  Grad accum steps:    {cfg.GRAD_ACCUM_STEPS}")
+    print(f"  Total / warmup:      {total_steps} / {warmup_steps}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 10: Training Loop with Early Stopping + Gradient Monitoring
@@ -1156,20 +1177,8 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
 
         with accelerator_obj.accumulate(model):
             with accelerator_obj.autocast():
-                logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
-
-                # labels: 0=SP1, 1=SP2, 2=SP4, 3=Negative
-                # binary_labels: 1 if Positive (0,1,2), 0 if Negative (3)
-                binary_labels = (labels != 3).long()
-                loss_binary = F.cross_entropy(logits_binary, binary_labels)
-
-                positive_mask = (labels != 3)
-                if positive_mask.sum() > 0:
-                    loss_triclass = F.cross_entropy(logits_triclass[positive_mask], labels[positive_mask], weight=criterion.weight[:3])
-                else:
-                    loss_triclass = torch.tensor(0.0, device=labels.device)
-
-                loss = (1 - cfg.LOSS_ALPHA) * loss_binary + cfg.LOSS_ALPHA * loss_triclass
+                logits = model(input_ids, attention_mask, shape_features)
+                loss = criterion(logits, labels)
 
             accelerator_obj.backward(loss)
 
@@ -1184,26 +1193,14 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
             scheduler.step()
             optimizer.zero_grad()
 
-        # Joint prediction for correct train accuracy
-        with torch.no_grad():
-            probs_binary = torch.softmax(logits_binary.float(), dim=1)
-            probs_triclass = torch.softmax(logits_triclass.float(), dim=1)
-            probs = torch.zeros(labels.size(0), 4, device=labels.device)
-            probs[:, 3] = probs_binary[:, 0]
-            for i in range(3):
-                probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
-            predicted = probs.argmax(dim=1)
-
-            # Gather metrics
-            predicted_g, labels_g, loss_g = accelerator_obj.gather_for_metrics((predicted, labels, loss.repeat(labels.size(0))))
-
-            running_loss += loss_g.sum().item()
-            total += labels_g.size(0)
-            correct += predicted_g.eq(labels_g).sum().item()
-
+        running_loss += loss.item() * labels.size(0)
+        _, predicted = logits.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
         if accelerator_obj.is_main_process:
             pbar.set_postfix({"loss": f"{running_loss/total:.4f}", "acc": f"{correct/total:.4f}"})
 
+    # Print gradient diagnostics for first few epochs
     if epoch_num < 5 and grad_norms and accelerator_obj.is_main_process:
         avg_norm = np.mean(grad_norms)
         max_norm_val = np.max(grad_norms)
@@ -1226,29 +1223,11 @@ def evaluate(model, loader, criterion, accelerator_obj):
         shape_features = batch["shape_features"]
         labels = batch["labels"]
         with accelerator_obj.autocast():
-            logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
+            logits = model(input_ids, attention_mask, shape_features)
+            loss = criterion(logits, labels)
 
-            binary_labels = (labels != 3).long()
-            loss_binary = F.cross_entropy(logits_binary, binary_labels)
-
-            positive_mask = (labels != 3)
-            if positive_mask.sum() > 0:
-                loss_triclass = F.cross_entropy(logits_triclass[positive_mask], labels[positive_mask], weight=criterion.weight[:3])
-            else:
-                loss_triclass = torch.tensor(0.0, device=labels.device)
-
-            loss = (1 - cfg.LOSS_ALPHA) * loss_binary + cfg.LOSS_ALPHA * loss_triclass
-
-        # Joint Probabilities
-        probs_binary = torch.softmax(logits_binary.float(), dim=1)
-        probs_triclass = torch.softmax(logits_triclass.float(), dim=1)
-        probs = torch.zeros(input_ids.size(0), 4, device=input_ids.device)
-        probs[:, 3] = probs_binary[:, 0]
-        for i in range(3):
-            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
-        preds = probs.argmax(dim=1)
-
-        # Gather predictions across GPUs
+        # Gather predictions across GPUs for correct accuracy
+        preds = logits.argmax(dim=1)
         preds, labels_gathered = accelerator_obj.gather_for_metrics((preds, labels))
         loss_gathered = accelerator_obj.gather_for_metrics(loss.repeat(labels.size(0)))
 
@@ -1261,9 +1240,10 @@ def evaluate(model, loader, criterion, accelerator_obj):
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
                 criterion, accelerator_obj, cfg):
-    print("\n" + "=" * 60)
-    print("TRAINING -- Hierarchical KAN (Script 20)")
-    print("=" * 60)
+    if accelerator_obj.is_main_process:
+        print("\n" + "=" * 60)
+        print("TRAINING -- G-CMAB Safe Core (Script 19)")
+        print("=" * 60)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_val_acc = 0.0
@@ -1281,7 +1261,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         val_loss, val_acc = evaluate(model, test_loader, criterion, accelerator_obj)
 
         elapsed = time.time() - t0
-        gap_percent = (train_acc - val_acc) * 100
+        gap = train_acc - val_acc
 
                 # Synchronize training metrics across all processes for consistent logging and stopping decisions
         train_loss_tensor = torch.tensor(train_loss, device=accelerator.device)
@@ -1294,10 +1274,11 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        # Sync before save / print
+        # Synchronize before printing and saving checkpoint
         accelerator_obj.wait_for_everyone()
 
-        backbone_lr = optimizer.param_groups[0]['lr']
+        backbone_lr = optimizer.param_groups[0]["lr"]
+        gap_percent = (train_acc - val_acc) * 100
         print(
             f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
             f"Train: {train_loss:.4f}/{train_acc:.4f} | "
@@ -1310,15 +1291,15 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             print(f"\n  ⏹ Early stopping at epoch {epoch+1} due to severe overfitting (Gap: {gap_percent:+.2f}% >= {cfg.MAX_OVERFITTING_GAP}%)")
             break
 
-        if epoch >= 3 and max(history["val_acc"]) < 0.30 and accelerator_obj.is_main_process:
+        if epoch >= 3 and max(history["val_acc"]) < 0.30:
             print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")
 
         if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
-
-            # Only main process saves checkpoint
+            
+            # Save checkpoint only on the main process
             if accelerator_obj.is_main_process:
                 unwrapped = accelerator_obj.unwrap_model(model)
                 torch.save({
@@ -1332,18 +1313,19 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                         "USE_LAYER_ATTN": cfg.USE_LAYER_ATTN,
                         "USE_MULTI_POOL": cfg.USE_MULTI_POOL,
                     },
-                }, os.path.join(cfg.MODEL_DIR, "best_hierarchical_kan.pt"))
-                print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap_percent/100:.2%})")
-            accelerator_obj.wait_for_everyone()
+                }, os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt"))
+                print(f"  -> Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
                 print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
-        
+
+        # Synchronize after checkpoint operations
         accelerator_obj.wait_for_everyone()
 
-    print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
+    if accelerator_obj.is_main_process:
+        print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
@@ -1351,20 +1333,20 @@ history = train_model(model, train_loader, test_loader, optimizer, scheduler,
                       criterion, accelerator, cfg)
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 11: Load Best Model & Full Evaluation (all processes load)
+# CELL 11: Load Best Model & Full Evaluation (main process only)
 # ═══════════════════════════════════════════════════════════════════════
 
-best_path = os.path.join(cfg.MODEL_DIR, "best_hierarchical_kan.pt")
+best_path = os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
 unwrapped = accelerator.unwrap_model(model)
 unwrapped.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
 print(f"Loaded best model from epoch {checkpoint['epoch']} "
       f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
 
 
 @torch.no_grad()
 def full_evaluation(model, test_loader, class_names, accelerator_obj):
+    model.eval()
     all_preds, all_targets, all_probs = [], [], []
     for batch in tqdm(test_loader, desc="  Evaluating", disable=not accelerator_obj.is_main_process):
         input_ids = batch["input_ids"]
@@ -1372,19 +1354,9 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
         shape_features = batch["shape_features"]
         labels = batch["labels"]
         with accelerator_obj.autocast():
-            logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
-
-        # Probabilities
-        probs_binary = torch.softmax(logits_binary.float(), dim=1)
-        probs_triclass = torch.softmax(logits_triclass.float(), dim=1)
-
-        # Joint Probabilities
-        probs = torch.zeros(input_ids.size(0), 4, device=input_ids.device)
-        probs[:, 3] = probs_binary[:, 0]  # P(Negative)
-        for i in range(3):
-            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
-
-        preds = probs.argmax(dim=1)
+            logits = model(input_ids, attention_mask, shape_features)
+        probs = torch.softmax(logits.float(), dim=1)
+        preds = logits.argmax(dim=1)
 
         preds_g, labels_g, probs_g = accelerator_obj.gather_for_metrics((preds, labels, probs))
         all_preds.extend(preds_g.cpu().numpy())
@@ -1404,7 +1376,7 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
 
         report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
         with open(report_path, "w") as f:
-            f.write("CLASSIFICATION REPORT -- Hierarchical KAN (Script 20)\n")
+            f.write("CLASSIFICATION REPORT -- G-CMAB Safe Core (Script 19)\n")
             f.write("=" * 60 + "\n")
             f.write(report_str)
         print(f"  -> Report saved: {report_path}")
@@ -1458,7 +1430,7 @@ if accelerator.is_main_process:
 # CELL 12: Generate All Performance Figures (main process only)
 # ═══════════════════════════════════════════════════════════════════════
 
-TITLE_PREFIX = "Hierarchical KAN (FP32 - Split LR)"
+TITLE_PREFIX = "G-CMAB Safe Core (DNABERT-2 + DNAshape)"
 
 def plot_training_curves(history, save_dir):
     epochs = len(history["train_loss"])
@@ -1478,7 +1450,7 @@ def plot_training_curves(history, save_dir):
 
     plt.suptitle(f"{TITLE_PREFIX} -- Training Progress", fontsize=16, fontweight="bold", y=1.02)
     plt.tight_layout()
-    path = os.path.join(save_dir, "hierarchical_kan_training_curves.png")
+    path = os.path.join(save_dir, "gcmab_training_curves.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> Training curves: {path}")
 
@@ -1504,7 +1476,7 @@ def plot_confusion_matrix(all_targets, all_preds, class_names, save_dir):
                         color="white" if data[i, j] > thresh else "black", fontsize=12, fontweight="bold")
     plt.suptitle(TITLE_PREFIX, fontsize=15, fontweight="bold", y=1.02)
     plt.tight_layout()
-    path = os.path.join(save_dir, "hierarchical_kan_confusion_matrix.png")
+    path = os.path.join(save_dir, "gcmab_confusion_matrix.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> Confusion matrix: {path}")
 
@@ -1534,7 +1506,7 @@ def plot_roc_curves(all_targets, all_probs, class_names, save_dir):
     plt.title(f"ROC Curves -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
     plt.legend(loc="lower right", fontsize=10); plt.grid(True, linestyle="--", alpha=0.3)
     plt.tight_layout()
-    path = os.path.join(save_dir, "hierarchical_kan_roc_curves.png")
+    path = os.path.join(save_dir, "gcmab_roc_curves.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> ROC curves: {path}")
 
@@ -1555,7 +1527,7 @@ def plot_precision_recall_curves(all_targets, all_probs, class_names, save_dir):
     plt.title(f"Precision-Recall Curves -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
     plt.legend(loc="lower left", fontsize=10); plt.grid(True, linestyle="--", alpha=0.3)
     plt.tight_layout()
-    path = os.path.join(save_dir, "hierarchical_kan_pr_curves.png")
+    path = os.path.join(save_dir, "gcmab_pr_curves.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> PR curves: {path}")
 
@@ -1579,7 +1551,7 @@ def plot_per_class_metrics_bar(all_targets, all_preds, class_names, save_dir):
     ax.set_title(f"Per-Class Performance -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
     ax.set_ylim(0, 1.15); ax.legend(fontsize=11); ax.grid(True, linestyle="--", alpha=0.3, axis="y")
     plt.tight_layout()
-    path = os.path.join(save_dir, "hierarchical_kan_per_class_metrics.png")
+    path = os.path.join(save_dir, "gcmab_per_class_metrics.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> Per-class metrics: {path}")
 
@@ -1601,7 +1573,7 @@ if accelerator.is_main_process:
 
 if accelerator.is_main_process:
     print("\n" + "=" * 60)
-    print("PIPELINE SUMMARY -- Hierarchical KAN (Script 20)")
+    print("PIPELINE SUMMARY -- G-CMAB Safe Core (Script 19)")
     print("=" * 60)
     print(f"  DNABERT-2:          Last {cfg.UNFREEZE_LAST_N_LAYERS} layers fine-tuned")
     print(f"  Max token length:   {MAX_LENGTH}")
@@ -1617,6 +1589,281 @@ if accelerator.is_main_process:
     print(f"  Best val acc:       {max(history['val_acc']):.4f}")
     print(f"  Model saved to:     {cfg.MODEL_DIR}")
     print()
+    print("  +-----------------------------------------------------------+")
+    print("  |  Script 14 (Cross-Modal):     61.33%  (overfit, gap 31%)  |")
+    print("  |  Script 15 (KAN, 11 changes): 53.43%  (over-regularized)  |")
+    print("  |  Script 16 (Unified):         25%     (BROKEN: no learn)  |")
+    print("  |  Script 17 (v2 Bug Fix):      34.21%  (EMA lag & pos_emb) |")
+    print("  |  Script 18 (Simplified Core): 60.81%  (gap 25.57%)        |")
+    print(f"  |  Script 19 (G-CMAB Safe):    {max(history['val_acc']):.2%}                      |")
+    print("  +-----------------------------------------------------------+")
+    print("=" * 60)
+
+# ═══════════════════════════════════════════════════════════════════════
+# CELL 13.5: SHAP Interpretability Analysis (FAD Style)
+# ═══════════════════════════════════════════════════════════════════════
+
+if accelerator.is_main_process:
+    print("\n" + "=" * 60)
+    print("RUNNING SHAP INTERPRETABILITY ANALYSIS")
+    print("=" * 60)
+    try:
+        import shap
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import numpy as np
+        import re
+        
+        # Run predictions on test loader (main process only)
+        model.eval()
+        all_preds = []
+        all_targets = []
+        device = accelerator.device
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                shape_features = batch["shape_features"].to(device)
+                labels = batch["labels"].to(device)
+                
+                logits = model(input_ids, attention_mask, shape_features)
+                preds = logits.argmax(dim=1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(labels.cpu().numpy())
+                
+        all_preds = np.array(all_preds)
+        all_targets = np.array(all_targets)
+        
+        # Filter indices for Subset A and Subset B
+        # Class index 2 represents "SP4"
+        sp4_class_idx = 2
+        
+        subset_A_indices = []  # Correct SP4 predictions
+        subset_B_indices = []  # Confused SP4 (predicted as SP1 or SP2)
+        
+        for idx in range(len(all_targets)):
+            if all_targets[idx] == sp4_class_idx:
+                pred = all_preds[idx]
+                if pred == sp4_class_idx:
+                    subset_A_indices.append(idx)
+                elif pred in [0, 1]:  # SP1 (0) or SP2 (1)
+                    subset_B_indices.append(idx)
+                    
+        print(f"  Subset A (Correct SP4): {len(subset_A_indices)} samples")
+        print(f"  Subset B (Confused SP4): {len(subset_B_indices)} samples")
+        
+        if len(subset_A_indices) > 0 and len(subset_B_indices) > 0:
+            # Extract background dataset from test set (bg_size = 50)
+            bg_size = 50
+            np.random.seed(cfg.RANDOM_SEED)
+            bg_indices = np.random.choice(len(test_dataset), min(bg_size, len(test_dataset)), replace=False)
+            
+            bg_input_ids = torch.stack([test_dataset[i]["input_ids"] for i in bg_indices]).to(device)
+            bg_attention_mask = torch.stack([test_dataset[i]["attention_mask"] for i in bg_indices]).to(device)
+            bg_shapes = torch.stack([test_dataset[i]["shape_features"] for i in bg_indices]).to(device)
+            
+            unwrapped_model = accelerator.unwrap_model(model)
+            with torch.no_grad():
+                bg_embeddings = unwrapped_model._get_bert_features(bg_input_ids, bg_attention_mask)
+                
+            # Define wrapper model that accepts differentiable embeddings and shapes
+            class ModelEmbeddingWrapper(nn.Module):
+                def __init__(self, gcmab_model):
+                    super().__init__()
+                    self.gcmab_model = gcmab_model
+                    
+                def forward(self, seq_embeddings, shape_features):
+                    B, T, _ = seq_embeddings.shape
+                    device = seq_embeddings.device
+                    attention_mask = torch.ones(B, T, dtype=torch.long, device=device)
+                    
+                    seq_features = self.gcmab_model.seq_projection(seq_embeddings)
+                    shape_feats = self.gcmab_model.shape_cnn(shape_features)
+                    
+                    seq_key_padding_mask = (attention_mask == 0)
+                    for cross_layer in self.gcmab_model.cross_attention_layers:
+                        seq_features, shape_feats = cross_layer(
+                            seq_features, shape_feats, seq_key_padding_mask=seq_key_padding_mask
+                        )
+                        
+                    if self.gcmab_model.use_multi_pool:
+                        seq_mean = self.gcmab_model._masked_mean_pool(seq_features, attention_mask)
+                        seq_max = self.gcmab_model._masked_max_pool(seq_features, attention_mask)
+                        seq_pooled = torch.cat([seq_mean, seq_max], dim=1)
+                        shape_pooled = self.gcmab_model._kmax_pool(shape_feats, k=self.gcmab_model.kmax_k)
+                    else:
+                        mask_expanded = attention_mask.unsqueeze(-1).float()
+                        seq_pooled = (seq_features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
+                        shape_pooled = shape_feats.mean(dim=1)
+                        
+                    fused = torch.cat([seq_pooled, shape_pooled], dim=1)
+                    logits = self.gcmab_model.classifier(fused)
+                    return logits
+                    
+            wrapper_model = ModelEmbeddingWrapper(unwrapped_model)
+            
+            # Select test samples to explain (up to 20 per subset)
+            num_explain = 20
+            explain_A_indices = subset_A_indices[:num_explain]
+            explain_B_indices = subset_B_indices[:num_explain]
+            
+            # Extract inputs to explain
+            test_A_input_ids = torch.stack([test_dataset[i]["input_ids"] for i in explain_A_indices]).to(device)
+            test_A_attention_mask = torch.stack([test_dataset[i]["attention_mask"] for i in explain_A_indices]).to(device)
+            test_A_shapes = torch.stack([test_dataset[i]["shape_features"] for i in explain_A_indices]).to(device)
+            
+            test_B_input_ids = torch.stack([test_dataset[i]["input_ids"] for i in explain_B_indices]).to(device)
+            test_B_attention_mask = torch.stack([test_dataset[i]["attention_mask"] for i in explain_B_indices]).to(device)
+            test_B_shapes = torch.stack([test_dataset[i]["shape_features"] for i in explain_B_indices]).to(device)
+            
+            with torch.no_grad():
+                test_A_embeddings = unwrapped_model._get_bert_features(test_A_input_ids, test_A_attention_mask)
+                test_B_embeddings = unwrapped_model._get_bert_features(test_B_input_ids, test_B_attention_mask)
+                
+            # Run GradientExplainer
+            print("  Running GradientExplainer on differentiable branches...")
+            explainer = shap.GradientExplainer(wrapper_model, [bg_embeddings, bg_shapes])
+            
+            shap_values_A = explainer.shap_values([test_A_embeddings, test_A_shapes])
+            shap_values_B = explainer.shap_values([test_B_embeddings, test_B_shapes])
+            
+            # Extract SHAP values for target class SP4 (index 2)
+            seq_shap_A = shap_values_A[sp4_class_idx][0]    # [N, T, 768]
+            shape_shap_A = shap_values_A[sp4_class_idx][1]  # [N, 5, 101]
+            
+            seq_shap_B = shap_values_B[sp4_class_idx][0]    # [N, T, 768]
+            shape_shap_B = shap_values_B[sp4_class_idx][1]  # [N, 5, 101]
+            
+            # ──────────────────────────────────────────────────────────
+            # Goal A: DNAshape Feature Importance Bar Chart
+            # ──────────────────────────────────────────────────────────
+            importance_shape_A = np.abs(shape_shap_A).sum(axis=2).mean(axis=0)
+            importance_shape_B = np.abs(shape_shap_B).sum(axis=2).mean(axis=0)
+            
+            features = ["MGW", "ProT", "Roll", "HelT", "EP"]
+            x = np.arange(len(features))
+            width = 0.35
+            
+            plt.figure(figsize=(8, 5))
+            plt.bar(x - width/2, importance_shape_A, width, label="Subset A (Correct SP4)", color="#4CAF50")
+            plt.bar(x + width/2, importance_shape_B, width, label="Subset B (Confused)", color="#F44336")
+            plt.xticks(x, features)
+            plt.ylabel("Mean Absolute SHAP Value")
+            plt.title("DNAshape Feature Importance (Subset A vs Subset B)")
+            plt.legend()
+            plt.grid(True, linestyle="--", alpha=0.3)
+            plt.tight_layout()
+            
+            shape_bar_path = os.path.join(cfg.FIG_DIR, "gcmab_shap_dnashape_bar.png")
+            plt.savefig(shape_bar_path, dpi=150)
+            plt.close()
+            print(f"  -> DNAshape SHAP bar chart saved to: {shape_bar_path}")
+            
+            # ──────────────────────────────────────────────────────────
+            # Goal B: Sequence Context Heatmap with RegEx Alignment
+            # ──────────────────────────────────────────────────────────
+            def get_char_shap_for_batch(explain_indices, seq_shap):
+                char_shaps = []
+                for idx_in_batch, original_idx in enumerate(explain_indices):
+                    seq = seq_test[original_idx]
+                    tokens = tokenizer.convert_ids_to_tokens(test_dataset[original_idx]["input_ids"])
+                    token_importance = np.linalg.norm(seq_shap[idx_in_batch], axis=1)
+                    
+                    char_shap = np.zeros(len(seq))
+                    char_counts = np.zeros(len(seq))
+                    
+                    current_char_idx = 0
+                    for t_idx, token in enumerate(tokens):
+                        if token in ["[CLS]", "[SEP]", "[PAD]", "<pad>", "<s>", "</s>", "<unk>"]:
+                            continue
+                        clean_token = token.replace("##", "").replace("Ġ", "").replace(" ", "")
+                        if not clean_token:
+                            continue
+                        
+                        pos = seq.find(clean_token, current_char_idx)
+                        if pos != -1:
+                            length = len(clean_token)
+                            char_shap[pos:pos+length] += token_importance[t_idx]
+                            char_counts[pos:pos+length] += 1
+                            current_char_idx = pos + length
+                            
+                    char_shap = np.where(char_counts > 0, char_shap / char_counts, 0.0)
+                    char_shaps.append(char_shap)
+                return char_shaps
+                
+            char_shap_A = get_char_shap_for_batch(explain_A_indices, seq_shap_A)
+            char_shap_B = get_char_shap_for_batch(explain_B_indices, seq_shap_B)
+            
+            seq_A_list = [seq_test[i] for i in explain_A_indices]
+            seq_B_list = [seq_test[i] for i in explain_B_indices]
+            
+            def align_and_average_shap(seq_list, char_shaps_list, window_size=15):
+                aligned_list = []
+                for seq, char_s in zip(seq_list, char_shaps_list):
+                    match = re.search(r'GGGCGG|CCGCCC', seq, re.IGNORECASE)
+                    if not match:
+                        continue
+                    start, end = match.span()
+                    center = (start + end) // 2
+                    
+                    aligned = np.zeros(2 * window_size + 1)
+                    for i, offset in enumerate(range(-window_size, window_size + 1)):
+                        abs_pos = center + offset
+                        if 0 <= abs_pos < len(char_s):
+                            aligned[i] = char_s[abs_pos]
+                    aligned_list.append(aligned)
+                if len(aligned_list) == 0:
+                    return None
+                return np.mean(aligned_list, axis=0)
+                
+            window_size = 15
+            avg_aligned_A = align_and_average_shap(seq_A_list, char_shap_A, window_size)
+            avg_aligned_B = align_and_average_shap(seq_B_list, char_shap_B, window_size)
+            
+            if avg_aligned_A is not None and avg_aligned_B is not None:
+                heatmap_data = np.vstack([avg_aligned_A, avg_aligned_B])
+                
+                plt.figure(figsize=(12, 3))
+                x_labels = [str(x) for x in range(-window_size, window_size + 1)]
+                sns.heatmap(heatmap_data, annot=False, cmap="viridis",
+                            yticklabels=["Subset A (Correct)", "Subset B (Confused)"],
+                            xticklabels=x_labels)
+                plt.xlabel("Position Relative to GC-box Center (bp)")
+                plt.title("Sequence Context SHAP Importance Alignment (GC-box Flank Analysis)")
+                plt.tight_layout()
+                
+                heatmap_path = os.path.join(cfg.FIG_DIR, "gcmab_shap_sequence_heatmap.png")
+                plt.savefig(heatmap_path, dpi=150)
+                plt.close()
+                print(f"  -> Sequence SHAP heatmap saved to: {heatmap_path}")
+                
+                plt.figure(figsize=(10, 4))
+                offsets = np.arange(-window_size, window_size + 1)
+                plt.plot(offsets, avg_aligned_A, label="Subset A (Correct)", color="#4CAF50", linewidth=2)
+                plt.plot(offsets, avg_aligned_B, label="Subset B (Confused)", color="#F44336", linewidth=2)
+                plt.axvline(x=0, color="gray", linestyle="--", alpha=0.7, label="GC-box Center")
+                plt.xlabel("Position Relative to GC-box Center (bp)")
+                plt.ylabel("Average SHAP Importance (L2 Norm)")
+                plt.title("Sequence Context SHAP Importance (Flanking Regions)")
+                plt.legend()
+                plt.grid(True, linestyle="--", alpha=0.3)
+                plt.tight_layout()
+                
+                line_path = os.path.join(cfg.FIG_DIR, "gcmab_shap_sequence_line.png")
+                plt.savefig(line_path, dpi=150)
+                plt.close()
+                print(f"  -> Sequence SHAP line chart saved to: {line_path}")
+            else:
+                print("  ⚠️ WARNING: Could not find any GC-box consensus motif in explains.")
+        else:
+            print("  ⚠️ WARNING: Subset A or Subset B is empty!")
+            
+    except Exception as shap_err:
+        print(f"  ⚠️ Error running SHAP analysis: {shap_err}")
+        import traceback
+        traceback.print_exc()
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 14: Zip Outputs for Easy Kaggle Download
@@ -1630,7 +1877,7 @@ if accelerator.is_main_process:
         FileLink = None
         ipy_display = None
 
-    zip_filename = "outputs_hierarchical_kan"
+    zip_filename = "outputs_gcmab_safe"
     shutil.make_archive(zip_filename, 'zip', cfg.OUTPUT_DIR)
     print(f"\nAll outputs zipped into: {zip_filename}.zip")
 
