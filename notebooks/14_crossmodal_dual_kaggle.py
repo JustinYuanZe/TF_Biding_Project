@@ -532,7 +532,7 @@ def patch_flash_attention():
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_dnabert2(model_name, device, unfreeze_last_n=3):
-    """Load DNABERT-2 with selective layer unfreezing."""
+    """Load DNABERT-2 with selective layer unfreezing directly using state_dict load (avoiding meta device issues)."""
     print("\n" + "=" * 60)
     print("LOADING DNABERT-2 BACKBONE (Selective Fine-Tuning)")
     print("=" * 60)
@@ -543,85 +543,31 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
     if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
         config.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 3
 
-    model = None
+    # Load empty config model directly to bypass meta-device errors on Kaggle
+    with torch.no_grad():
+        model = AutoModel.from_config(config, trust_remote_code=True)
 
-    # Strategy 1: Direct load
+    from huggingface_hub import hf_hub_download
     try:
-        model = AutoModel.from_pretrained(
-            model_name, config=config,
-            trust_remote_code=True,
-            low_cpu_mem_usage=False,
-        )
-        for name, param in model.named_parameters():
-            if param.device == torch.device("meta"):
-                raise RuntimeError(f"Parameter {name} on meta device")
-        for name, buf in model.named_buffers():
-            if buf.device == torch.device("meta"):
-                raise RuntimeError(f"Buffer {name} on meta device")
-        print("  Strategy 1 (direct load) OK")
-    except Exception as e:
-        print(f"  Strategy 1 failed: {e}")
-        model = None
+        weight_file = hf_hub_download(repo_id=model_name, filename="model.safetensors")
+        from safetensors.torch import load_file
+        state_dict = load_file(weight_file, device="cpu")
+    except Exception:
+        weight_file = hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
+        state_dict = torch.load(weight_file, map_location="cpu", weights_only=False)
 
-    # Strategy 2: Empty init + manual state_dict
-    if model is None:
-        try:
-            print("  Trying Strategy 2 (empty init + state_dict)...")
-            from huggingface_hub import hf_hub_download
+    clean_sd = {}
+    for k, v in state_dict.items():
+        clean_sd[k[5:] if k.startswith("bert.") else k] = v
 
-            with torch.no_grad():
-                model = AutoModel.from_config(config, trust_remote_code=True)
+    result = model.load_state_dict(clean_sd, strict=False)
+    critical = ["embeddings.word_embeddings.weight",
+                "encoder.layer.0.attention.self.Wqkv.weight"]
+    for ck in critical:
+        if ck in set(result.missing_keys):
+            raise RuntimeError(f"Core weight '{ck}' missing!")
 
-            try:
-                weight_file = hf_hub_download(repo_id=model_name, filename="model.safetensors")
-                from safetensors.torch import load_file
-                state_dict = load_file(weight_file, device="cpu")
-            except Exception:
-                weight_file = hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
-                state_dict = torch.load(weight_file, map_location="cpu", weights_only=False)
-
-            clean_sd = {}
-            for k, v in state_dict.items():
-                clean_sd[k[5:] if k.startswith("bert.") else k] = v
-
-            result = model.load_state_dict(clean_sd, strict=False)
-            critical = ["embeddings.word_embeddings.weight",
-                        "encoder.layer.0.attention.self.Wqkv.weight"]
-            for ck in critical:
-                if ck in set(result.missing_keys):
-                    raise RuntimeError(f"Core weight '{ck}' missing!")
-
-            model = model.to("cpu")
-            print("  Strategy 2 OK")
-        except Exception as e:
-            print(f"  Strategy 2 failed: {e}")
-            model = None
-
-    # Strategy 3: Monkey-patch torch.empty meta->cpu
-    if model is None:
-        try:
-            print("  Trying Strategy 3 (monkey-patch ALiBi)...")
-            _orig_empty = torch.empty
-            def _patched_empty(*args, **kwargs):
-                if kwargs.get("device") == torch.device("meta") or str(kwargs.get("device", "")) == "meta":
-                    kwargs["device"] = "cpu"
-                return _orig_empty(*args, **kwargs)
-            torch.empty = _patched_empty
-            try:
-                model = AutoModel.from_pretrained(
-                    model_name, config=config,
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=False,
-                )
-            finally:
-                torch.empty = _orig_empty
-            print("  Strategy 3 OK")
-        except Exception as e:
-            raise RuntimeError(
-                f"All loading strategies failed. Last error: {e}\n"
-                "Try: pip install --upgrade transformers torch safetensors"
-            ) from e
-
+    model = model.to("cpu")
     patch_flash_attention()
 
     # Selective Freezing / Unfreezing
@@ -631,20 +577,10 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
     total_layers = len(model.encoder.layer)
     unfreeze_from = total_layers - unfreeze_last_n
 
-    frozen_count = 0
-    unfrozen_count = 0
-
     for i, layer in enumerate(model.encoder.layer):
         if i >= unfreeze_from:
             for param in layer.parameters():
                 param.requires_grad = True
-                unfrozen_count += param.numel()
-        else:
-            for param in layer.parameters():
-                frozen_count += param.numel()
-
-    for param in model.embeddings.parameters():
-        frozen_count += param.numel()
 
     model = model.to(device)
 
@@ -1050,15 +986,17 @@ print(f"    Late Pooling:   MeanPool AFTER cross-attention (not before)")
 
 def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
                     scaler, device, grad_accum_steps):
-    """Train for one epoch with gradient accumulation."""
+    """Train for one epoch with gradient accumulation and clean 1% progress logging."""
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
     optimizer.zero_grad()
 
-    pbar = tqdm(train_loader, desc="  Training", leave=False)
-    for step, batch in enumerate(pbar):
+    total_steps = len(train_loader)
+    last_percent = -1
+
+    for step, batch in enumerate(train_loader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         shape_features = batch["shape_features"].to(device)
@@ -1084,10 +1022,19 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
-        pbar.set_postfix({
-            "loss": f"{running_loss/total:.4f}",
-            "acc": f"{correct/total:.4f}",
-        })
+        # Update and print progress every 1% increment with a visual progress bar
+        percent = int((step + 1) / total_steps * 100)
+        if percent > last_percent:
+            bar_len = 20
+            filled_len = int(bar_len * percent / 100)
+            bar = "█" * filled_len + "░" * (bar_len - filled_len)
+            sys.stdout.write(f"\r  Training: [{bar}] {percent}% | Loss: {running_loss/total:.4f} | Acc: {correct/total:.4f}   ")
+            sys.stdout.flush()
+            last_percent = percent
+
+    # Clear the temporary training line
+    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.flush()
 
     return running_loss / total, correct / total
 
@@ -1205,7 +1152,10 @@ def full_evaluation(model, test_loader, class_names, device):
     """Run full evaluation and return predictions/probabilities."""
     all_preds, all_targets, all_probs = [], [], []
 
-    for batch in tqdm(test_loader, desc="  Evaluating"):
+    total_batches = len(test_loader)
+    last_percent = -1
+
+    for step, batch in enumerate(test_loader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         shape_features = batch["shape_features"].to(device)
@@ -1219,6 +1169,20 @@ def full_evaluation(model, test_loader, class_names, device):
         all_preds.extend(preds.cpu().numpy())
         all_targets.extend(labels.numpy())
         all_probs.extend(probs.cpu().numpy())
+
+        # Update and print progress every 1% increment with a visual progress bar
+        percent = int((step + 1) / total_batches * 100)
+        if percent > last_percent:
+            bar_len = 20
+            filled_len = int(bar_len * percent / 100)
+            bar = "█" * filled_len + "░" * (bar_len - filled_len)
+            sys.stdout.write(f"\r  Evaluating: [{bar}] {percent}%   ")
+            sys.stdout.flush()
+            last_percent = percent
+
+    # Clear the temporary evaluation line
+    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.flush()
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
