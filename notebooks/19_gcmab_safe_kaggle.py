@@ -49,6 +49,9 @@ install_packages()
 # ═══════════════════════════════════════════════════════════════════════
 
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import gc
 import copy
 import math
@@ -83,20 +86,17 @@ from sklearn.preprocessing import label_binarize
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from tqdm import tqdm
 
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 # ── HuggingFace Accelerate ──
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
-print(f"PyTorch version: {torch.__version__}")
-print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    try:
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
-    except AttributeError:
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    n_gpus = torch.cuda.device_count()
-    print(f"Number of GPUs: {n_gpus}")
     torch.backends.cudnn.benchmark = True
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -257,16 +257,31 @@ accelerator = Accelerator(
 )
 DEVICE = accelerator.device
 
-if accelerator.is_main_process:
-    print(f"\nUsing device: {DEVICE}")
-    print(f"Num processes: {accelerator.num_processes}")
-    print(f"Architecture: G-CMAB Safe Core (Script 19)")
-    print(f"  Base: Script 18 (d_model={cfg.CROSS_ATTN_D_MODEL}, 1 cross-attn, weighted-CE)")
-    print(f"  Flag 1 — Strided Conv:   {cfg.USE_STRIDED_CONV}")
-    print(f"  Flag 2 — GroupNorm:       {cfg.USE_GROUPNORM}")
-    print(f"  Flag 3 — Layer-Attention: {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N})")
-    print(f"  Flag 4 — Multi-Pool:      {cfg.USE_MULTI_POOL} (K-Max k={cfg.KMAX_K})")
-    print("=" * 60)
+# Redefine print globally to suppress non-main process logging in DDP/Multi-GPU
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    try:
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    except AttributeError:
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    n_gpus = torch.cuda.device_count()
+    print(f"Number of GPUs: {n_gpus}")
+
+print(f"\nUsing device: {DEVICE}")
+print(f"Num processes: {accelerator.num_processes}")
+print(f"Architecture: G-CMAB Safe Core (Script 19)")
+print(f"  Base: Script 18 (d_model={cfg.CROSS_ATTN_D_MODEL}, 1 cross-attn, weighted-CE)")
+print(f"  Flag 1 — Strided Conv:   {cfg.USE_STRIDED_CONV}")
+print(f"  Flag 2 — GroupNorm:       {cfg.USE_GROUPNORM}")
+print(f"  Flag 3 — Layer-Attention: {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N})")
+print(f"  Flag 4 — Multi-Pool:      {cfg.USE_MULTI_POOL} (K-Max k={cfg.KMAX_K})")
+print("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 3: Data Loading (Sequences + DNAshape Features)
@@ -1252,23 +1267,29 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        if accelerator_obj.is_main_process:
-            print(
-                f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
-                f"Train: {train_loss:.4f}/{train_acc:.4f} | "
-                f"Val: {val_loss:.4f}/{val_acc:.4f} | "
-                f"Gap: {gap:.2%} | LR: {optimizer.param_groups[0]['lr']:.1e} | {elapsed:.0f}s"
-            )
+        # Synchronize before printing and saving checkpoint
+        accelerator_obj.wait_for_everyone()
 
-            if epoch >= 3 and max(history["val_acc"]) < 0.30:
-                print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")
+        backbone_lr = optimizer.param_groups[0]["lr"]
+        gap_percent = (train_acc - val_acc) * 100
+        print(
+            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
+            f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+            f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+            f"Gap: {gap_percent:+.2f}% | "
+            f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
+        )
 
-            if val_acc > best_val_acc:
-                best_val_loss = val_loss
-                best_val_acc = val_acc
-                patience_counter = 0
-                # Save with accelerator (handles DDP unwrapping)
-                accelerator_obj.wait_for_everyone()
+        if epoch >= 3 and max(history["val_acc"]) < 0.30:
+            print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")
+
+        if val_acc > best_val_acc:
+            best_val_loss = val_loss
+            best_val_acc = val_acc
+            patience_counter = 0
+            
+            # Save checkpoint only on the main process
+            if accelerator_obj.is_main_process:
                 unwrapped = accelerator_obj.unwrap_model(model)
                 torch.save({
                     "epoch": epoch + 1,
@@ -1282,12 +1303,15 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                         "USE_MULTI_POOL": cfg.USE_MULTI_POOL,
                     },
                 }, os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt"))
-                print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap:.2%})")
-            else:
-                patience_counter += 1
-                if patience_counter >= cfg.PATIENCE:
-                    print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
-                    break
+                print(f"  -> Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= cfg.PATIENCE:
+                print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
+                break
+
+        # Synchronize after checkpoint operations
+        accelerator_obj.wait_for_everyone()
 
     if accelerator_obj.is_main_process:
         print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
@@ -1301,13 +1325,12 @@ history = train_model(model, train_loader, test_loader, optimizer, scheduler,
 # CELL 11: Load Best Model & Full Evaluation (main process only)
 # ═══════════════════════════════════════════════════════════════════════
 
-if accelerator.is_main_process:
-    best_path = os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt")
-    checkpoint = torch.load(best_path, map_location=accelerator.device)
-    unwrapped = accelerator.unwrap_model(model)
-    unwrapped.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded best model from epoch {checkpoint['epoch']} "
-          f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
+best_path = os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt")
+checkpoint = torch.load(best_path, map_location=DEVICE)
+unwrapped = accelerator.unwrap_model(model)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
+print(f"Loaded best model from epoch {checkpoint['epoch']} "
+      f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
 
 
 @torch.no_grad()
