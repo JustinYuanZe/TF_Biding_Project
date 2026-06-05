@@ -1332,7 +1332,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                         "USE_LAYER_ATTN": cfg.USE_LAYER_ATTN,
                         "USE_MULTI_POOL": cfg.USE_MULTI_POOL,
                     },
-                }, os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt"))
+                }, os.path.join(cfg.MODEL_DIR, "best_hierarchical_kan.pt"))
                 print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap_percent/100:.2%})")
             accelerator_obj.wait_for_everyone()
         else:
@@ -1354,7 +1354,7 @@ history = train_model(model, train_loader, test_loader, optimizer, scheduler,
 # CELL 11: Load Best Model & Full Evaluation (all processes load)
 # ═══════════════════════════════════════════════════════════════════════
 
-best_path = os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt")
+best_path = os.path.join(cfg.MODEL_DIR, "best_hierarchical_kan.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
 unwrapped = accelerator.unwrap_model(model)
 unwrapped.load_state_dict(checkpoint["model_state_dict"])
@@ -1478,7 +1478,7 @@ def plot_training_curves(history, save_dir):
 
     plt.suptitle(f"{TITLE_PREFIX} -- Training Progress", fontsize=16, fontweight="bold", y=1.02)
     plt.tight_layout()
-    path = os.path.join(save_dir, "gcmab_training_curves.png")
+    path = os.path.join(save_dir, "hierarchical_kan_training_curves.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> Training curves: {path}")
 
@@ -1504,7 +1504,7 @@ def plot_confusion_matrix(all_targets, all_preds, class_names, save_dir):
                         color="white" if data[i, j] > thresh else "black", fontsize=12, fontweight="bold")
     plt.suptitle(TITLE_PREFIX, fontsize=15, fontweight="bold", y=1.02)
     plt.tight_layout()
-    path = os.path.join(save_dir, "gcmab_confusion_matrix.png")
+    path = os.path.join(save_dir, "hierarchical_kan_confusion_matrix.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> Confusion matrix: {path}")
 
@@ -1534,7 +1534,7 @@ def plot_roc_curves(all_targets, all_probs, class_names, save_dir):
     plt.title(f"ROC Curves -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
     plt.legend(loc="lower right", fontsize=10); plt.grid(True, linestyle="--", alpha=0.3)
     plt.tight_layout()
-    path = os.path.join(save_dir, "gcmab_roc_curves.png")
+    path = os.path.join(save_dir, "hierarchical_kan_roc_curves.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> ROC curves: {path}")
 
@@ -1555,7 +1555,7 @@ def plot_precision_recall_curves(all_targets, all_probs, class_names, save_dir):
     plt.title(f"Precision-Recall Curves -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
     plt.legend(loc="lower left", fontsize=10); plt.grid(True, linestyle="--", alpha=0.3)
     plt.tight_layout()
-    path = os.path.join(save_dir, "gcmab_pr_curves.png")
+    path = os.path.join(save_dir, "hierarchical_kan_pr_curves.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> PR curves: {path}")
 
@@ -1579,7 +1579,7 @@ def plot_per_class_metrics_bar(all_targets, all_preds, class_names, save_dir):
     ax.set_title(f"Per-Class Performance -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
     ax.set_ylim(0, 1.15); ax.legend(fontsize=11); ax.grid(True, linestyle="--", alpha=0.3, axis="y")
     plt.tight_layout()
-    path = os.path.join(save_dir, "gcmab_per_class_metrics.png")
+    path = os.path.join(save_dir, "hierarchical_kan_per_class_metrics.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     print(f"  -> Per-class metrics: {path}")
 
@@ -1601,7 +1601,7 @@ if accelerator.is_main_process:
 
 if accelerator.is_main_process:
     print("\n" + "=" * 60)
-    print("PIPELINE SUMMARY -- G-CMAB Safe Core (Script 19/20)")
+    print("PIPELINE SUMMARY -- Hierarchical KAN (Script 20)")
     print("=" * 60)
     print(f"  DNABERT-2:          Last {cfg.UNFREEZE_LAST_N_LAYERS} layers fine-tuned")
     print(f"  Max token length:   {MAX_LENGTH}")
@@ -1630,7 +1630,7 @@ if accelerator.is_main_process:
         FileLink = None
         ipy_display = None
 
-    zip_filename = "outputs_gcmab_safe"
+    zip_filename = "outputs_hierarchical_kan"
     shutil.make_archive(zip_filename, 'zip', cfg.OUTPUT_DIR)
     print(f"\nAll outputs zipped into: {zip_filename}.zip")
 
