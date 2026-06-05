@@ -181,6 +181,7 @@ class Config:
     GRAD_ACCUM_STEPS = 4
     EPOCHS = 30
     PATIENCE = 12
+    MAX_OVERFITTING_GAP = 30.0  # Max train-val gap (%) to prevent severe overfitting
     WARMUP_RATIO = 0.15
     MAX_GRAD_NORM = 1.0
 
@@ -967,6 +968,12 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         elapsed = time.time() - t0
         gap_percent = (train_acc - val_acc) * 100
 
+                # Synchronize training metrics across all processes for consistent logging and stopping decisions
+        train_loss_tensor = torch.tensor(train_loss, device=accelerator.device)
+        train_acc_tensor = torch.tensor(train_acc, device=accelerator.device)
+        train_loss = accelerator.gather(train_loss_tensor).mean().item()
+        train_acc = accelerator.gather(train_acc_tensor).mean().item()
+
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
@@ -979,6 +986,10 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             f"Gap: {gap_percent:+.2f}% | "
             f"LR: {optimizer.param_groups[0]['lr']:.1e} | {elapsed:.0f}s"
         )
+
+        if gap_percent >= cfg.MAX_OVERFITTING_GAP:
+            print(f"\n  ⏹ Early stopping at epoch {epoch+1} due to severe overfitting (Gap: {gap_percent:+.2f}% >= {cfg.MAX_OVERFITTING_GAP}%)")
+            break
 
         if epoch >= 3 and max(history["val_acc"]) < 0.30 and accelerator.is_main_process:
             print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")

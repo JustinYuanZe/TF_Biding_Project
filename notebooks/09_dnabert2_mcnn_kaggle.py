@@ -146,6 +146,7 @@ class Config:
     WEIGHT_DECAY = 1e-4
     EPOCHS = 30
     PATIENCE = 7           # Early stopping patience
+    MAX_OVERFITTING_GAP = 30.0  # Max train-val gap (%) to prevent severe overfitting
     LR_PATIENCE = 3        # ReduceLROnPlateau patience
     LR_FACTOR = 0.5
     GRAD_ACCUM_STEPS = 1   # Set to 1 for consistency since script 09 doesn't accumulate gradients
@@ -733,6 +734,12 @@ def train_mcnn(model, train_loader, val_loader, cfg, device):
         scheduler.step(val_loss)
         elapsed = time.time() - t0
 
+                # Synchronize training metrics across all processes for consistent logging and stopping decisions
+        train_loss_tensor = torch.tensor(train_loss, device=accelerator.device)
+        train_acc_tensor = torch.tensor(train_acc, device=accelerator.device)
+        train_loss = accelerator.gather(train_loss_tensor).mean().item()
+        train_acc = accelerator.gather(train_acc_tensor).mean().item()
+
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
@@ -747,6 +754,10 @@ def train_mcnn(model, train_loader, val_loader, cfg, device):
             f"Gap: {gap_percent:+.2f}% | "
             f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
         )
+
+        if gap_percent >= cfg.MAX_OVERFITTING_GAP:
+            print(f"\n  ⏹ Early stopping at epoch {epoch+1} due to severe overfitting (Gap: {gap_percent:+.2f}% >= {cfg.MAX_OVERFITTING_GAP}%)")
+            break
 
         # ── Checkpointing & Early Stopping ──
         accelerator.wait_for_everyone()
