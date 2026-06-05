@@ -1730,11 +1730,11 @@ if accelerator.is_main_process:
             shap_values_B = explainer.shap_values([test_B_embeddings, test_B_shapes])
             
             # Extract SHAP values for target class SP4 (index 2)
-            seq_shap_A = shap_values_A[sp4_class_idx][0]    # [N, T, 768]
-            shape_shap_A = shap_values_A[sp4_class_idx][1]  # [N, 5, 101]
+            seq_shap_A = shap_values_A[0][..., sp4_class_idx]    # [N, T, 768]
+            shape_shap_A = shap_values_A[1][..., sp4_class_idx]  # [N, 5, 101]
             
-            seq_shap_B = shap_values_B[sp4_class_idx][0]    # [N, T, 768]
-            shape_shap_B = shap_values_B[sp4_class_idx][1]  # [N, 5, 101]
+            seq_shap_B = shap_values_B[0][..., sp4_class_idx]    # [N, T, 768]
+            shape_shap_B = shap_values_B[1][..., sp4_class_idx]  # [N, 5, 101]
             
             # ──────────────────────────────────────────────────────────
             # Goal A: DNAshape Feature Importance Bar Chart
