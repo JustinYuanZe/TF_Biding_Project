@@ -1729,12 +1729,28 @@ if accelerator.is_main_process:
             shap_values_A = explainer.shap_values([test_A_embeddings, test_A_shapes])
             shap_values_B = explainer.shap_values([test_B_embeddings, test_B_shapes])
             
-            # Extract SHAP values for target class SP4 (index 2)
-            seq_shap_A = shap_values_A[0][..., sp4_class_idx]    # [N, T, 768]
-            shape_shap_A = shap_values_A[1][..., sp4_class_idx]  # [N, 5, 101]
-            
-            seq_shap_B = shap_values_B[0][..., sp4_class_idx]    # [N, T, 768]
-            shape_shap_B = shap_values_B[1][..., sp4_class_idx]  # [N, 5, 101]
+            # Extract SHAP values for target class SP4 (index 2) dynamically
+            if isinstance(shap_values_A, list) and len(shap_values_A) == 2:
+                seq_shap_A = shap_values_A[0]
+                shape_shap_A = shap_values_A[1]
+                if seq_shap_A.ndim > 3:
+                    seq_shap_A = seq_shap_A[..., sp4_class_idx]
+                if shape_shap_A.ndim > 3:
+                    shape_shap_A = shape_shap_A[..., sp4_class_idx]
+            else:
+                seq_shap_A = shap_values_A[sp4_class_idx][0]
+                shape_shap_A = shap_values_A[sp4_class_idx][1]
+                
+            if isinstance(shap_values_B, list) and len(shap_values_B) == 2:
+                seq_shap_B = shap_values_B[0]
+                shape_shap_B = shap_values_B[1]
+                if seq_shap_B.ndim > 3:
+                    seq_shap_B = seq_shap_B[..., sp4_class_idx]
+                if shape_shap_B.ndim > 3:
+                    shape_shap_B = shape_shap_B[..., sp4_class_idx]
+            else:
+                seq_shap_B = shap_values_B[sp4_class_idx][0]
+                shape_shap_B = shap_values_B[sp4_class_idx][1]
             
             # ──────────────────────────────────────────────────────────
             # Goal A: DNAshape Feature Importance Bar Chart
