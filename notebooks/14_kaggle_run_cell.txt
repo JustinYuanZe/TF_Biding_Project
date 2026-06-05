@@ -1,0 +1,8 @@
+!git clone https://github.com/JustinYuanZe/TF_Biding_Project.git
+%cd TF_Biding_Project
+import torch
+num_gpus = torch.cuda.device_count()
+if num_gpus > 1:
+    get_ipython().system(f"accelerate launch --mixed_precision=no --multi_gpu --num_processes={num_gpus} notebooks/14_crossmodal_dual_kaggle.py")
+else:
+    get_ipython().system("python notebooks/14_crossmodal_dual_kaggle.py")
