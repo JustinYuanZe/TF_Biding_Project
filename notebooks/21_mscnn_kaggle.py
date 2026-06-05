@@ -921,12 +921,83 @@ class GCMABmsCNNClassifier(nn.Module):
         )
 
     def _get_bert_features(self, input_ids, attention_mask):
-        outputs = self.backbone(input_ids, attention_mask=attention_mask)
-        if self.use_layer_attn and hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-            selected = outputs.hidden_states[-self.cfg.LAYER_ATTN_N:]
-            return self.layer_attention(selected)
-        else:
+        """Extract BERT features, optionally using Layer-Attention."""
+        if self.use_layer_attn and not getattr(self, '_layer_attn_fallback', False):
+            try:
+                outputs = self.backbone(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+                # Try to get hidden_states
+                if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                    all_hidden = outputs.hidden_states  # tuple of (n_layers+1) tensors
+                    # Take last N layers (skip embedding layer at index 0)
+                    n = min(self.cfg.LAYER_ATTN_N, len(all_hidden) - 1)
+                    selected = list(all_hidden[-n:])
+                    return self.layer_attention(selected)
+                elif isinstance(outputs, tuple) and len(outputs) > 2:
+                    # In some versions, output is a tuple where the third element contains hidden states
+                    all_hidden = outputs[2]
+                    if isinstance(all_hidden, tuple) or isinstance(all_hidden, list):
+                        n = min(self.cfg.LAYER_ATTN_N, len(all_hidden) - 1)
+                        selected = list(all_hidden[-n:])
+                        return self.layer_attention(selected)
+                    else:
+                        self._layer_attn_fallback = True
+                else:
+                    # Fallback: hidden_states not available in output
+                    if accelerator.is_main_process:
+                        print("  [LayerAttn] WARNING: hidden_states not in output, using hook fallback...")
+                    self._layer_attn_fallback = True
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"  [LayerAttn] WARNING: output_hidden_states failed ({e}), using hook fallback...")
+                self._layer_attn_fallback = True
+
+        if self.use_layer_attn and getattr(self, '_layer_attn_fallback', False):
+            # Hook-based fallback: register hooks on encoder layers
+            hidden_states_collected = []
+            hooks = []
+            n = min(self.cfg.LAYER_ATTN_N, len(self.backbone.encoder.layer))
+            start_layer = len(self.backbone.encoder.layer) - n
+
+            def make_hook(storage):
+                def hook_fn(module, input, output):
+                    # output is typically (hidden_states, ...) or just hidden_states
+                    if isinstance(output, tuple):
+                        storage.append(output[0])
+                    else:
+                        storage.append(output)
+                return hook_fn
+
+            for i in range(start_layer, len(self.backbone.encoder.layer)):
+                h = self.backbone.encoder.layer[i].register_forward_hook(make_hook(hidden_states_collected))
+                hooks.append(h)
+
+            _ = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+
+            for h in hooks:
+                h.remove()
+
+            mixed = self.layer_attention(hidden_states_collected)
+            if mixed.dim() == 2:
+                B = attention_mask.size(0)
+                T = attention_mask.size(1)
+                D = mixed.size(-1)
+                padded = torch.zeros(B, T, D, dtype=mixed.dtype, device=mixed.device)
+                padded[attention_mask.bool()] = mixed
+                mixed = padded
+            return mixed
+
+        # No Layer-Attention: use last hidden state
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        if isinstance(outputs, tuple) or isinstance(outputs, list):
+            return outputs[0]
+        elif hasattr(outputs, "last_hidden_state"):
             return outputs.last_hidden_state
+        else:
+            return outputs
 
     def forward(self, input_ids, attention_mask, shape_features):
         hidden_states = self._get_bert_features(input_ids, attention_mask)
