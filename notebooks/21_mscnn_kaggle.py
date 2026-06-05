@@ -84,10 +84,11 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 
-# Mask triton to force DNABERT-2 to fallback to standard PyTorch attention
-# and avoid Triton-based compilation errors.
+# Mask triton.language to force DNABERT-2 to fallback to standard attention,
+# but keep a mock 'triton' in sys.modules to satisfy HuggingFace check_imports.
 import sys
-sys.modules['triton'] = None
+import types
+sys.modules['triton'] = types.ModuleType('triton')
 
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from tqdm import tqdm
