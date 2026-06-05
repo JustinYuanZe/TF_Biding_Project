@@ -22,11 +22,29 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupShuffleSplit
 
-# Mask triton.language to force DNABERT-2 to fallback to standard attention,
-# but keep a mock 'triton' in sys.modules to satisfy HuggingFace check_imports.
+# Use a custom import hook to force DNABERT-2 to fallback to standard PyTorch attention,
+# while allowing other components (like torch._dynamo or HF check_imports) to import Triton normally.
+import builtins
 import sys
-import types
-sys.modules['triton'] = types.ModuleType('triton')
+
+orig_import = builtins.__import__
+
+def custom_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == 'triton' or name.startswith('triton.'):
+        try:
+            frame = sys._getframe(1)
+            while frame:
+                filename = frame.f_code.co_filename
+                if 'flash_attn_triton' in filename or 'bert_layers' in filename:
+                    raise ImportError("Forced fallback for DNABERT-2 custom Triton attention")
+                frame = frame.f_back
+        except ImportError:
+            raise
+        except Exception:
+            pass
+    return orig_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = custom_import
 
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 
