@@ -3,47 +3,6 @@
 Script 16: Unified Cross-Modal Attention Dual-Branch (DNABERT-2 + DNAshape)
 Designed for: Kaggle GPU (T4/P100) or Google Colab
 Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
-
-═══════════════════════════════════════════════════════════════════════════
-DESIGN PHILOSOPHY — "Keep Script 14's proven core, add ONLY low-risk gains"
-═══════════════════════════════════════════════════════════════════════════
-
-Script 14 reached Val Acc 61.33% BUT overfit hard (Train 92% / Val 61% → 31% gap).
-Script 15 tried to fix overfitting with 11 simultaneous changes and REGRESSED to
-53.43% — because it (a) halved BERT capacity (6→3 layers), (b) stacked conflicting
-loss terms (Focal + R-Drop α=1.0 + class-weight + label-smoothing), and (c) could
-not attribute cause to any single change.
-
-Script 16 keeps the HIGH-CAPACITY, DIRECT, STABLE core of Script 14 and adds only
-improvements that DO NOT cut learning capacity and DO NOT conflict:
-
-  CORE (unchanged from Script 14 — proven):
-    - Unfreeze last 6 BERT layers          (strong sequence fine-tuning)
-    - 1 direct Cross-Attention layer        (short, stable gradient path)
-    - MLP-256 + GELU classifier             (stable hyperplane head)
-    - Weighted Cross-Entropy base loss      (single clean objective)
-    - NO DropPath, NO R-Drop                (no gradient chaos)
-
-  ANTI-OVERFIT (capacity-neutral — NEW, attacks the 31% gap without crippling):
-    [1] max_length 512 → auto (~48)         removes ~470 spurious padding tokens
-                                             that diluted cross-attention (BIG win)
-    [2] Layer-wise LR decay (0.9)           deeper BERT layers learn slower
-    [3] Fusion dropout 0.3 → 0.4            mild extra regularization
-    [4] EMA weights (decay 0.999)           free +1-2% val, smoother minima
-
-  LOW-RISK ADDITIONS (ported from Script 15 — kept because r-risk≈0):
-    [I] Shape positional embedding          Conv loses absolute position
-    [J] Sequence attention pooling          learns which positions matter
-    [K] Focal Loss gamma=1.0 (mild)         gentle focus on hard SP1/SP4 confusion
-
-  DEFERRED (high-variance — available behind flags for ablation only):
-    - ChebyKAN head    (HEAD_TYPE="kan", hidden 256 / degree 3 — NOT cut to 64)
-    - 2 cross-attn layers, DropPath, R-Drop (all OFF by default)
-
-Every addition is a CONFIG FLAG so you can run the ablation plan one knob at a time.
-
-Required packages (auto-installed):
-  pip install transformers einops datasets accelerate safetensors
 """
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -52,6 +11,11 @@ Required packages (auto-installed):
 
 import subprocess
 import sys
+import os
+
+# Suppress Hugging Face warnings and tokenizers parallelism messages
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def install_packages():
     """Install required packages that are not pre-installed on Kaggle."""
@@ -62,13 +26,15 @@ def install_packages():
         "accelerate>=0.25.0",
         "safetensors>=0.4.0",
     ]
-    for pkg in packages:
-        try:
-            pkg_name = pkg.split(">=")[0].split("==")[0]
-            __import__(pkg_name)
-        except ImportError:
-            print(f"Installing {pkg}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+    # Only run pip install on local rank 0 to avoid race conditions
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        for pkg in packages:
+            try:
+                pkg_name = pkg.split(">=")[0].split("==")[0]
+                __import__(pkg_name)
+            except ImportError:
+                print(f"Installing {pkg}...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 install_packages()
 
@@ -76,7 +42,6 @@ install_packages()
 # CELL 1: Imports
 # ═══════════════════════════════════════════════════════════════════════
 
-import os
 import gc
 import copy
 import math
@@ -85,6 +50,12 @@ import random
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -92,7 +63,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
@@ -114,7 +84,6 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     torch.backends.cudnn.benchmark = True
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -122,7 +91,6 @@ if torch.cuda.is_available():
 # ═══════════════════════════════════════════════════════════════════════
 
 def find_file(filename, fallback_dir="data/processed"):
-    """Search for target_file in absolute paths, Kaggle input, fallback dirs, or CWD."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
     if os.path.exists("/kaggle/input"):
@@ -144,7 +112,6 @@ def find_file(filename, fallback_dir="data/processed"):
 
 
 def auto_detect_dir(target_file, fallback="data/processed"):
-    """Search for the directory containing target_file in Kaggle input or local path."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:
         return os.path.dirname(resolved_path)
@@ -165,62 +132,60 @@ class Config:
     DNABERT_MODEL = "zhihan1996/DNABERT-2-117M"
     EMBEDDING_DIM = 768
 
-    # ── Sequence length (ANTI-OVERFIT [1]) ──
-    # 101bp sequences tokenize to ~25-40 BPE tokens. Script 14/15 used 512 →
-    # ~470 padding tokens diluting cross-attention. We auto-detect from data.
-    AUTO_MAX_LENGTH = True         # compute from p99 token length over training set
-    MAX_TOKEN_LENGTH = 48          # fallback / used if AUTO_MAX_LENGTH is False
-    MAX_LENGTH_CAP = 96            # hard upper bound when auto-detecting
-    MAX_LENGTH_FLOOR = 32          # hard lower bound when auto-detecting
+    # ── Sequence length ──
+    AUTO_MAX_LENGTH = True
+    MAX_TOKEN_LENGTH = 48
+    MAX_LENGTH_CAP = 96
+    MAX_LENGTH_FLOOR = 32
 
-    # ── Fine-Tuning Strategy (CORE — proven in Script 14) ──
+    # ── Fine-Tuning Strategy ──
     UNFREEZE_LAST_N_LAYERS = 6
     BACKBONE_LR = 1.0e-5
-    USE_LAYERWISE_LR_DECAY = True  # ANTI-OVERFIT [2]: deeper layers learn slower
-    LAYERWISE_LR_DECAY = 0.9       # lr(layer) = BACKBONE_LR * decay^(dist_from_top)
+    USE_LAYERWISE_LR_DECAY = True
+    LAYERWISE_LR_DECAY = 0.9
 
-    # ── Cross-Modal Attention (CORE) ──
+    # ── Cross-Modal Attention ──
     CROSS_ATTN_D_MODEL = 128
     CROSS_ATTN_NHEAD = 4
-    CROSS_ATTN_LAYERS = 1          # 1 = direct (Script 14 win). 2 = deeper (ablation)
+    CROSS_ATTN_LAYERS = 1
     CROSS_ATTN_DROPOUT = 0.1
     CROSS_ATTN_LR = 2e-4
     SEQ_PROJ_LR = 2e-4
 
-    # ── DropPath (DEFERRED — OFF by default) ──
+    # ── DropPath ──
     USE_DROP_PATH = False
     DROP_PATH_RATE = 0.0
 
     # ── DNAshape Branch ──
-    SHAPE_CHANNELS = 5             # MGW, ProT, Roll, HelT, EP
+    SHAPE_CHANNELS = 5
     SHAPE_SEQ_LEN = 101
     SHAPE_CONV_CHANNELS = [32, 64, 128]
     SHAPE_LR = 3.0e-4
-    USE_SHAPE_POS_EMBED = True     # LOW-RISK [I]: learnable positional embedding
+    USE_SHAPE_POS_EMBED = True
 
-    # ── Pooling (LOW-RISK [J]) ──
-    USE_ATTENTION_POOLING = True   # seq: learnable query token (else masked mean)
+    # ── Pooling ──
+    USE_ATTENTION_POOLING = True
     ATTN_POOL_LR = 2e-4
 
     # ── Classifier Head ──
-    HEAD_TYPE = "mlp"              # "mlp" (CORE, stable) | "kan" (ablation)
-    HIDDEN_DIM = 256               # kept WIDE (Script 15's bug: cut to 64)
-    KAN_DEGREE = 3                 # only used if HEAD_TYPE == "kan"
-    FUSION_DROPOUT = 0.4           # ANTI-OVERFIT [3]: 0.3 → 0.4
+    HEAD_TYPE = "mlp"
+    HIDDEN_DIM = 256
+    KAN_DEGREE = 3
+    FUSION_DROPOUT = 0.4
     HEAD_LR = 5e-5
 
-    # ── Loss (LOW-RISK [K]) ──
-    LOSS_TYPE = "focal"            # "focal" (mild) | "weighted_ce" (Script 14)
-    FOCAL_GAMMA = 1.0              # mild (Script 15 used 2.0 — too aggressive)
+    # ── Loss ──
+    LOSS_TYPE = "focal"
+    FOCAL_GAMMA = 1.0
     LABEL_SMOOTHING = 0.1
     NUM_CLASSES = 4
     WEIGHT_DECAY = 0.1
 
-    # ── R-Drop (DEFERRED — OFF by default) ──
+    # ── R-Drop ──
     USE_RDROP = False
-    RDROP_ALPHA = 0.0              # if enabled, keep ≤ 0.3 (Script 15 used 1.0)
+    RDROP_ALPHA = 0.0
 
-    # ── EMA (ANTI-OVERFIT [4]) ──
+    # ── EMA ──
     USE_EMA = True
     EMA_DECAY = 0.999
 
@@ -230,7 +195,7 @@ class Config:
     EPOCHS = 25
     PATIENCE = 10
     WARMUP_RATIO = 0.1
-    MAX_GRAD_NORM = 1.0            # Script 14 value (Script 15's 0.5 was too tight)
+    MAX_GRAD_NORM = 1.0
 
     # ── Data Split ──
     TEST_SIZE = 0.2
@@ -258,7 +223,22 @@ torch.manual_seed(cfg.RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.RANDOM_SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Initialize Accelerator
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
+    kwargs_handlers=[ddp_kwargs],
+)
+DEVICE = accelerator.device
+
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
 print(f"\nUsing device: {DEVICE}")
 print(f"Architecture: Unified Cross-Modal Attention Dual-Branch (Script 16)")
 print(f"  CORE (Script 14): unfreeze={cfg.UNFREEZE_LAST_N_LAYERS}, "
@@ -276,7 +256,6 @@ print(f"  DEFERRED (off): drop_path={cfg.USE_DROP_PATH}, rdrop={cfg.USE_RDROP}")
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_fasta(filepath):
-    """Load DNA sequences and their headers from a FASTA file."""
     sequences = []
     headers = []
     if not os.path.exists(filepath):
@@ -301,9 +280,7 @@ def load_fasta(filepath):
 
 
 def load_shape_features(data_dir, shape_files):
-    """Load pre-computed DNAshape feature matrices (.npy)."""
     all_shapes = []
-
     neg_shape_path = None
     neg_candidates = ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]
     for cand in neg_candidates:
@@ -334,7 +311,6 @@ def load_shape_features(data_dir, shape_files):
 
 
 def load_all_data(fasta_dir, shape_dir, shape_files):
-    """Load all 4 classes: sequences + shape features + group-aware labels."""
     print("=" * 60)
     print("LOADING DATASETS (Sequences + DNAshape Features)")
     print("=" * 60)
@@ -369,8 +345,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         all_sequences.extend(seqs)
         all_headers.extend(hdrs)
         all_labels.extend([cls_idx] * len(seqs))
-        # Positives are stored as adjacent (fwd, revcomp) pairs → same group
-        # so reverse-complement copies never straddle the train/test split.
         if cls_name != "Negative":
             for i in range(0, len(seqs), 2):
                 all_groups.extend([group_id, group_id])
@@ -397,7 +371,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
 
 
 def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=42):
-    """Group-aware train/test split (no revcomp leakage)."""
     print("\n" + "=" * 60)
     print("SPLITTING DATA (GroupShuffleSplit — no revcomp leakage)")
     print("=" * 60)
@@ -434,7 +407,6 @@ gc.collect()
 # ═══════════════════════════════════════════════════════════════════════
 
 def robust_normalize_shapes(shape_train, shape_test):
-    """Apply Robust Scaler normalization per channel. Stats from TRAINING SET ONLY."""
     print("\n" + "=" * 60)
     print("NORMALIZING DNAshape FEATURES (Robust Scaler P1-P99)")
     print("=" * 60)
@@ -536,7 +508,6 @@ def patch_flash_attention():
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_dnabert2(model_name, device, unfreeze_last_n=6):
-    """Load DNABERT-2 with selective layer unfreezing."""
     print("\n" + "=" * 60)
     print("LOADING DNABERT-2 BACKBONE (Selective Fine-Tuning)")
     print("=" * 60)
@@ -548,7 +519,6 @@ def load_dnabert2(model_name, device, unfreeze_last_n=6):
 
     model = None
 
-    # Strategy 1: Direct load
     try:
         model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=True, low_cpu_mem_usage=False)
         for name, param in model.named_parameters():
@@ -562,7 +532,6 @@ def load_dnabert2(model_name, device, unfreeze_last_n=6):
         print(f"  Strategy 1 failed: {e}")
         model = None
 
-    # Strategy 2: Empty init + manual state_dict
     if model is None:
         try:
             print("  Trying Strategy 2 (empty init + state_dict)...")
@@ -587,7 +556,6 @@ def load_dnabert2(model_name, device, unfreeze_last_n=6):
             print(f"  Strategy 2 failed: {e}")
             model = None
 
-    # Strategy 3: Monkey-patch torch.empty meta->cpu
     if model is None:
         try:
             print("  Trying Strategy 3 (monkey-patch ALiBi)...")
@@ -607,7 +575,7 @@ def load_dnabert2(model_name, device, unfreeze_last_n=6):
 
     patch_flash_attention()
 
-    # Selective Freezing / Unfreezing
+    # Selective Freezing
     for param in model.parameters():
         param.requires_grad = False
     total_layers = len(model.encoder.layer)
@@ -630,9 +598,7 @@ def load_dnabert2(model_name, device, unfreeze_last_n=6):
 
 dnabert_model, tokenizer = load_dnabert2(cfg.DNABERT_MODEL, DEVICE, cfg.UNFREEZE_LAST_N_LAYERS)
 
-# ── ANTI-OVERFIT [1]: Auto-detect max token length from data ──
 def compute_max_token_length(sequences, tok, sample_size=2000, percentile=99, floor=32, cap=96):
-    """Tokenize a sample to find the p99 token length, then clamp to [floor, cap]."""
     if len(sequences) > sample_size:
         idx = random.sample(range(len(sequences)), sample_size)
         sample = [sequences[i] for i in idx]
@@ -640,15 +606,14 @@ def compute_max_token_length(sequences, tok, sample_size=2000, percentile=99, fl
         sample = sequences
     lengths = [len(tok(s, add_special_tokens=True)["input_ids"]) for s in sample]
     p_val = int(np.percentile(lengths, percentile))
-    chosen = int(max(floor, min(cap, p_val + 2)))  # +2 slack for special tokens
+    chosen = int(max(floor, min(cap, p_val + 2)))
     print("\n" + "=" * 60)
-    print("AUTO MAX TOKEN LENGTH (ANTI-OVERFIT [1])")
+    print("AUTO MAX TOKEN LENGTH")
     print("=" * 60)
     print(f"  Token length (sample n={len(sample)}): "
           f"min={min(lengths)}, mean={np.mean(lengths):.1f}, "
           f"p{percentile}={p_val}, max={max(lengths)}")
-    print(f"  Chosen MAX_TOKEN_LENGTH = {chosen}  (was 512 in Scripts 14/15 → "
-          f"~{512/chosen:.0f}x fewer padding tokens)")
+    print(f"  Chosen MAX_TOKEN_LENGTH = {chosen}")
     return chosen
 
 if cfg.AUTO_MAX_LENGTH:
@@ -665,7 +630,6 @@ else:
 # ═══════════════════════════════════════════════════════════════════════
 
 class DropPath(nn.Module):
-    """Stochastic depth: randomly drops entire residual branches during training."""
     def __init__(self, drop_prob=0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -680,11 +644,6 @@ class DropPath(nn.Module):
 
 
 class ChebyKANLinear(nn.Module):
-    """
-    KAN layer with Chebyshev polynomial basis + linear residual.
-    y = base_linear(x) + sum_d coeff_d * T_d(tanh(x))
-    Only used when HEAD_TYPE == "kan" (hidden kept WIDE, degree kept LOW).
-    """
     def __init__(self, in_features, out_features, degree=3):
         super().__init__()
         self.in_features = in_features
@@ -704,18 +663,12 @@ class ChebyKANLinear(nn.Module):
             T.append(x_norm)
         for n in range(2, self.degree + 1):
             T.append(2.0 * x_norm * T[-1] - T[-2])
-        cheby_basis = torch.stack(T, dim=-1)             # [B, in, degree+1]
+        cheby_basis = torch.stack(T, dim=-1)
         kan_output = torch.einsum('bid,oid->bo', cheby_basis, self.cheby_coeffs)
         return base_output + kan_output
 
 
 class SpatialShapeCNN(nn.Module):
-    """
-    Conv1D on DNAshape features, PRESERVING spatial dimension (no GlobalAvgPool).
-    Optionally adds a learnable positional embedding (LOW-RISK [I]).
-
-    Input:  [B, 5, 101]  → Output: [B, 25, d_model]
-    """
     def __init__(self, in_channels=5, conv_channels=None, d_model=128,
                  use_pos_embed=True, max_positions=26):
         super().__init__()
@@ -727,18 +680,18 @@ class SpatialShapeCNN(nn.Module):
             nn.BatchNorm1d(conv_channels[0]),
             nn.GELU(),
             nn.MaxPool1d(kernel_size=2),
-        )  # [B, 32, 50]
+        )
         self.conv_block2 = nn.Sequential(
             nn.Conv1d(conv_channels[0], conv_channels[1], kernel_size=5, padding=2),
             nn.BatchNorm1d(conv_channels[1]),
             nn.GELU(),
             nn.MaxPool1d(kernel_size=2),
-        )  # [B, 64, 25]
+        )
         self.conv_block3 = nn.Sequential(
             nn.Conv1d(conv_channels[1], conv_channels[2], kernel_size=3, padding=1),
             nn.BatchNorm1d(conv_channels[2]),
             nn.GELU(),
-        )  # [B, 128, 25]
+        )
 
         self.proj = nn.Linear(conv_channels[-1], d_model) if conv_channels[-1] != d_model else nn.Identity()
 
@@ -750,15 +703,14 @@ class SpatialShapeCNN(nn.Module):
         x = self.conv_block1(x)
         x = self.conv_block2(x)
         x = self.conv_block3(x)
-        x = x.transpose(1, 2)    # [B, 25, conv_channels[-1]]
-        x = self.proj(x)         # [B, 25, d_model]
+        x = x.transpose(1, 2)
+        x = self.proj(x)
         if self.use_pos_embed:
             x = x + self.pos_embed[:, :x.size(1), :]
         return x
 
 
 class FeedForward(nn.Module):
-    """Post-attention FFN with residual (+ optional DropPath)."""
     def __init__(self, d_model, expansion=4, dropout=0.1, drop_path=0.0):
         super().__init__()
         self.net = nn.Sequential(
@@ -776,12 +728,6 @@ class FeedForward(nn.Module):
 
 
 class CrossModalAttentionLayer(nn.Module):
-    """
-    Single layer of Bidirectional Cross-Modal Attention.
-      1D->3D: Sequence queries structural features
-      3D->1D: Structure queries sequence features
-    DropPath defaults to 0 (Script 14 behaviour).
-    """
     def __init__(self, d_model=128, nhead=4, dropout=0.1, drop_path=0.0):
         super().__init__()
         self.cross_attn_seq2shape = nn.MultiheadAttention(
@@ -799,14 +745,12 @@ class CrossModalAttentionLayer(nn.Module):
         self.ffn_shape = FeedForward(d_model, expansion=4, dropout=dropout, drop_path=drop_path)
 
     def forward(self, seq_features, shape_features, seq_key_padding_mask=None):
-        # 1D -> 3D: sequence queries structure
         attended_seq, _ = self.cross_attn_seq2shape(
             query=seq_features, key=shape_features, value=shape_features
         )
         seq_out = self.norm_seq(seq_features + self.drop_path_seq(attended_seq))
         seq_out = self.ffn_seq(seq_out)
 
-        # 3D -> 1D: structure queries sequence
         attended_shape, _ = self.cross_attn_shape2seq(
             query=shape_features, key=seq_features, value=seq_features,
             key_padding_mask=seq_key_padding_mask
@@ -817,7 +761,6 @@ class CrossModalAttentionLayer(nn.Module):
 
 
 class AttentionPooling(nn.Module):
-    """Learnable query token that attends over a sequence to produce one vector (LOW-RISK [J])."""
     def __init__(self, d_model, nhead=4, dropout=0.1):
         super().__init__()
         self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
@@ -834,15 +777,6 @@ class AttentionPooling(nn.Module):
 
 
 class UnifiedCrossModalClassifier(nn.Module):
-    """
-    Script 16: Unified Cross-Modal Attention Dual-Branch.
-
-    Branch 1 — DNABERT-2:  full tokens [B, T, 768] -> Linear -> [B, T, d_model]
-    Branch 2 — SpatialShapeCNN(+pos): [B, 5, 101] -> [B, 25, d_model]
-    Cross-Modal Attention: bidirectional seq<->shape (num_cross_layers)
-    Pooling: seq via AttentionPooling or masked-mean; shape via mean
-    Head: MLP-256+GELU (default) or ChebyKAN (ablation)
-    """
     def __init__(self, backbone, embedding_dim=768,
                  shape_in_channels=5, shape_conv_channels=None,
                  d_model=128, nhead=4, num_cross_layers=1, cross_dropout=0.1,
@@ -855,7 +789,6 @@ class UnifiedCrossModalClassifier(nn.Module):
         self.d_model = d_model
         self.use_attention_pooling = use_attention_pooling
 
-        # Branch 1: DNABERT-2 token projection
         self.seq_projection = nn.Sequential(
             nn.Linear(embedding_dim, d_model),
             nn.LayerNorm(d_model),
@@ -863,7 +796,6 @@ class UnifiedCrossModalClassifier(nn.Module):
             nn.Dropout(0.1),
         )
 
-        # Branch 2: SpatialShapeCNN
         if shape_conv_channels is None:
             shape_conv_channels = [32, 64, 128]
         self.shape_cnn = SpatialShapeCNN(
@@ -871,7 +803,6 @@ class UnifiedCrossModalClassifier(nn.Module):
             d_model=d_model, use_pos_embed=use_shape_pos_embed,
         )
 
-        # Cross-Modal Attention stack
         if use_drop_path and num_cross_layers > 1:
             dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_cross_layers)]
         else:
@@ -882,13 +813,11 @@ class UnifiedCrossModalClassifier(nn.Module):
             for i in range(num_cross_layers)
         ])
 
-        # Sequence pooling
         if use_attention_pooling:
             self.seq_attn_pool = AttentionPooling(d_model, nhead=nhead, dropout=cross_dropout)
         else:
             self.seq_attn_pool = None
 
-        # Classifier head
         fusion_dim = d_model * 2
         if head_type == "kan":
             self.classifier = nn.Sequential(
@@ -898,7 +827,7 @@ class UnifiedCrossModalClassifier(nn.Module):
                 nn.Dropout(p=fusion_dropout),
                 ChebyKANLinear(hidden_dim, num_classes, degree=kan_degree),
             )
-        else:  # "mlp"
+        else:
             self.classifier = nn.Sequential(
                 nn.LayerNorm(fusion_dim),
                 nn.Linear(fusion_dim, hidden_dim),
@@ -909,10 +838,10 @@ class UnifiedCrossModalClassifier(nn.Module):
 
     def forward(self, input_ids, attention_mask, shape_features):
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs[0]                          # [B, T, 768]
-        seq_features = self.seq_projection(hidden_states)   # [B, T, d_model]
+        hidden_states = outputs[0]
+        seq_features = self.seq_projection(hidden_states)
 
-        shape_feats = self.shape_cnn(shape_features)        # [B, 25, d_model]
+        shape_feats = self.shape_cnn(shape_features)
 
         seq_key_padding_mask = (attention_mask == 0)
         for cross_layer in self.cross_attention_layers:
@@ -920,7 +849,6 @@ class UnifiedCrossModalClassifier(nn.Module):
                 seq_features, shape_feats, seq_key_padding_mask=seq_key_padding_mask
             )
 
-        # Late pooling (AFTER cross-attention)
         if self.use_attention_pooling:
             seq_pooled = self.seq_attn_pool(seq_features, key_padding_mask=seq_key_padding_mask)
         else:
@@ -931,13 +859,11 @@ class UnifiedCrossModalClassifier(nn.Module):
         fused = torch.cat([seq_pooled, shape_pooled], dim=1)
         return self.classifier(fused)
 
-
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 8: Dataset & DataLoaders
 # ═══════════════════════════════════════════════════════════════════════
 
 class DualBranchDataset(Dataset):
-    """Dataset providing tokenized DNA sequences and DNAshape features."""
     def __init__(self, sequences, labels, shape_features, tokenizer, max_length=48):
         self.sequences = sequences
         self.labels = labels
@@ -974,7 +900,7 @@ print(f"\nDataLoaders ready: {len(train_loader)} train batches, {len(test_loader
 print(f"Sequence max_length = {MAX_LENGTH} | effective batch = {cfg.BATCH_SIZE * cfg.GRAD_ACCUM_STEPS}")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 9: Build Model, EMA, Optimizer (layer-wise LR), Loss
+# CELL 9: Build Model, EMA, Optimizer, Loss
 # ═══════════════════════════════════════════════════════════════════════
 
 model = UnifiedCrossModalClassifier(
@@ -996,12 +922,9 @@ model = UnifiedCrossModalClassifier(
     num_classes=cfg.NUM_CLASSES,
     fusion_dropout=cfg.FUSION_DROPOUT,
 )
-model = model.to(DEVICE)
 
-
-# ── EMA wrapper (ANTI-OVERFIT [4]) ──
+# ── EMA wrapper ──
 class ModelEMA:
-    """Exponential Moving Average of model parameters for smoother eval weights."""
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -1012,19 +935,14 @@ class ModelEMA:
             if v.dtype.is_floating_point:
                 self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
             else:
-                self.shadow[k].copy_(v)  # buffers like num_batches_tracked
+                self.shadow[k].copy_(v)
 
     def state_dict(self):
         return self.shadow
 
 
-ema = ModelEMA(model, decay=cfg.EMA_DECAY) if cfg.USE_EMA else None
-
-
-# ── Optimizer with layer-wise LR decay on backbone (ANTI-OVERFIT [2]) ──
+# ── Optimizer with layer-wise LR decay ──
 param_groups = []
-
-# Backbone: one group per unfrozen layer, deeper layers get smaller LR
 total_bert_layers = len(model.backbone.encoder.layer)
 unfreeze_from = total_bert_layers - cfg.UNFREEZE_LAST_N_LAYERS
 if cfg.USE_LAYERWISE_LR_DECAY:
@@ -1032,7 +950,6 @@ if cfg.USE_LAYERWISE_LR_DECAY:
         layer_params = [p for p in layer.parameters() if p.requires_grad]
         if not layer_params:
             continue
-        # distance from top: top layer (last) -> 0, earlier -> larger -> smaller LR
         dist_from_top = (total_bert_layers - 1) - i
         layer_lr = cfg.BACKBONE_LR * (cfg.LAYERWISE_LR_DECAY ** dist_from_top)
         param_groups.append({"params": layer_params, "lr": layer_lr, "weight_decay": cfg.WEIGHT_DECAY})
@@ -1040,7 +957,6 @@ else:
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
     param_groups.append({"params": backbone_params, "lr": cfg.BACKBONE_LR, "weight_decay": cfg.WEIGHT_DECAY})
 
-# Heads
 param_groups.append({"params": list(model.seq_projection.parameters()),       "lr": cfg.SEQ_PROJ_LR,   "weight_decay": cfg.WEIGHT_DECAY})
 param_groups.append({"params": list(model.shape_cnn.parameters()),            "lr": cfg.SHAPE_LR,      "weight_decay": cfg.WEIGHT_DECAY})
 param_groups.append({"params": list(model.cross_attention_layers.parameters()), "lr": cfg.CROSS_ATTN_LR, "weight_decay": cfg.WEIGHT_DECAY})
@@ -1054,13 +970,20 @@ total_steps = (len(train_loader) // cfg.GRAD_ACCUM_STEPS) * cfg.EPOCHS
 warmup_steps = int(total_steps * cfg.WARMUP_RATIO)
 
 def lr_lambda(current_step):
-    """Linear warmup then cosine decay (applied to every param group's base lr)."""
     if current_step < warmup_steps:
         return float(current_step) / float(max(1, warmup_steps))
     progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
     return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+# Prepare components with Accelerator
+model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+    model, optimizer, train_loader, test_loader, scheduler
+)
+
+# Initialize EMA on unwrapped model
+ema = ModelEMA(accelerator.unwrap_model(model), decay=cfg.EMA_DECAY) if cfg.USE_EMA else None
 
 # Class weights
 class_counts = np.bincount(y_train)
@@ -1070,7 +993,6 @@ print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]
 
 
 class FocalLoss(nn.Module):
-    """FL(p_t) = -alpha_t * (1-p_t)^gamma * log(p_t). gamma=0 reduces to weighted CE."""
     def __init__(self, alpha=None, gamma=1.0, label_smoothing=0.0, reduction='mean'):
         super().__init__()
         self.alpha = alpha
@@ -1091,10 +1013,8 @@ class FocalLoss(nn.Module):
 if cfg.LOSS_TYPE == "focal":
     criterion = FocalLoss(alpha=class_weights_tensor, gamma=cfg.FOCAL_GAMMA,
                           label_smoothing=cfg.LABEL_SMOOTHING)
-else:  # "weighted_ce"
+else:
     criterion = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=cfg.LABEL_SMOOTHING)
-
-scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
 
 # Model summary
 trainable_total = sum(p.numel() for g in param_groups for p in g["params"])
@@ -1106,15 +1026,14 @@ print(f"  Trainable params:    {trainable_total:,}")
 print(f"  Head type:           {cfg.HEAD_TYPE.upper()} (hidden={cfg.HIDDEN_DIM})")
 print(f"  Cross-attn layers:   {cfg.CROSS_ATTN_LAYERS}")
 print(f"  Loss:                {cfg.LOSS_TYPE} (gamma={cfg.FOCAL_GAMMA})")
-print(f"  EMA:                 {cfg.USE_EMA} (decay={cfg.EMA_DECAY})")
+print(f"  EMA:                 {cfg.USE_EMA}")
 print(f"  Total / warmup steps:{total_steps} / {warmup_steps}")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 10: Training Loop (EMA + optional R-Drop) with Early Stopping
+# CELL 10: Training Loop with Early Stopping
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_rdrop_kl(logits1, logits2):
-    """Symmetric KL divergence for R-Drop regularization."""
     p1 = F.log_softmax(logits1, dim=-1)
     p2 = F.log_softmax(logits2, dim=-1)
     kl1 = F.kl_div(p1, p2.detach().exp(), reduction='batchmean')
@@ -1122,7 +1041,7 @@ def compute_rdrop_kl(logits1, logits2):
     return (kl1 + kl2) / 2
 
 
-def train_one_epoch(model, loader, optimizer, scheduler, criterion, scaler, device,
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
                     grad_accum_steps, ema=None, use_rdrop=False, rdrop_alpha=0.0,
                     max_grad_norm=1.0):
     model.train()
@@ -1131,42 +1050,47 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, scaler, devi
     total = 0
     optimizer.zero_grad()
 
-    pbar = tqdm(loader, desc="  Training", leave=False)
+    pbar = tqdm(loader, desc="  Training", leave=False, disable=not accelerator.is_main_process)
     for step, batch in enumerate(pbar):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
 
-        with autocast(enabled=(device.type == "cuda")):
-            if use_rdrop and rdrop_alpha > 0:
-                logits = model(input_ids, attention_mask, shape_features)
-                logits2 = model(input_ids, attention_mask, shape_features)
-                ce_loss = (criterion(logits, labels) + criterion(logits2, labels)) / 2
-                kl_loss = compute_rdrop_kl(logits, logits2)
-                loss = ce_loss + rdrop_alpha * kl_loss
-            else:
-                logits = model(input_ids, attention_mask, shape_features)
-                loss = criterion(logits, labels)
-            loss = loss / grad_accum_steps
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                if use_rdrop and rdrop_alpha > 0:
+                    logits = model(input_ids, attention_mask, shape_features)
+                    logits2 = model(input_ids, attention_mask, shape_features)
+                    ce_loss = (criterion(logits, labels) + criterion(logits2, labels)) / 2
+                    kl_loss = compute_rdrop_kl(logits, logits2)
+                    loss = ce_loss + rdrop_alpha * kl_loss
+                else:
+                    logits = model(input_ids, attention_mask, shape_features)
+                    loss = criterion(logits, labels)
 
-        scaler.scale(loss).backward()
+            accelerator.backward(loss)
 
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
             if ema is not None:
-                ema.update(model)
+                ema.update(accelerator.unwrap_model(model))
 
-        running_loss += loss.item() * grad_accum_steps * labels.size(0)
-        _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        pbar.set_postfix({"loss": f"{running_loss/total:.4f}", "acc": f"{correct/total:.4f}"})
+        # Gather metrics across processes
+        with torch.no_grad():
+            t_loss = torch.tensor([loss.item() * grad_accum_steps], device=device)
+            logits_g, labels_g, loss_g = accelerator.gather_for_metrics((logits, labels, t_loss))
+            running_loss += loss_g.mean().item() * labels_g.size(0)
+            _, predicted = logits_g.max(1)
+            total += labels_g.size(0)
+            correct += predicted.eq(labels_g).sum().item()
+
+        if accelerator.is_main_process:
+            pbar.set_postfix({"loss": f"{running_loss/total:.4f}", "acc": f"{correct/total:.4f}"})
 
     return running_loss / total, correct / total
 
@@ -1174,28 +1098,33 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, scaler, devi
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    all_logits = []
+    all_labels = []
     for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"].to(device)
-        with autocast(enabled=(device.type == "cuda")):
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
-            loss = criterion(logits, labels)
-        running_loss += loss.item() * labels.size(0)
-        _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-    return running_loss / total, correct / total
+
+        logits_gathered, labels_gathered = accelerator.gather_for_metrics((logits, labels))
+        all_logits.append(logits_gathered.cpu())
+        all_labels.append(labels_gathered.cpu())
+
+    all_logits = torch.cat(all_logits, dim=0).to(device)
+    all_labels = torch.cat(all_labels, dim=0).to(device)
+
+    val_loss = criterion(all_logits, all_labels).item()
+    preds = all_logits.argmax(dim=1)
+    val_acc = (preds == all_labels).float().mean().item()
+    return val_loss, val_acc
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, scaler, cfg, device, ema=None):
+                criterion, cfg, device, ema=None):
     print("\n" + "=" * 60)
-    print("TRAINING -- Unified Cross-Modal Attention (Script 16)")
+    print("TRAINING -- Unified Cross-Modal Attention")
     print("=" * 60)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -1207,22 +1136,22 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion, scaler, device,
+            model, train_loader, optimizer, scheduler, criterion, device,
             cfg.GRAD_ACCUM_STEPS, ema=ema, use_rdrop=cfg.USE_RDROP,
             rdrop_alpha=cfg.RDROP_ALPHA, max_grad_norm=cfg.MAX_GRAD_NORM,
         )
 
-        # Evaluate with EMA weights if enabled (swap in, eval, restore)
         if ema is not None:
-            backup = copy.deepcopy(model.state_dict())
-            model.load_state_dict(ema.state_dict(), strict=True)
+            unwrapped = accelerator.unwrap_model(model)
+            backup = copy.deepcopy(unwrapped.state_dict())
+            unwrapped.load_state_dict(ema.state_dict(), strict=True)
             val_loss, val_acc = evaluate(model, test_loader, criterion, device)
-            model.load_state_dict(backup, strict=True)
+            unwrapped.load_state_dict(backup, strict=True)
         else:
             val_loss, val_acc = evaluate(model, test_loader, criterion, device)
 
         elapsed = time.time() - t0
-        gap = train_acc - val_acc
+        gap_percent = (train_acc - val_acc) * 100
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
@@ -1233,22 +1162,24 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
             f"Train: {train_loss:.4f}/{train_acc:.4f} | "
             f"Val: {val_loss:.4f}/{val_acc:.4f} | "
-            f"Gap: {gap:.2%} | LR: {optimizer.param_groups[0]['lr']:.1e} | {elapsed:.0f}s"
+            f"Gap: {gap_percent:+.2f}% | "
+            f"LR: {optimizer.param_groups[0]['lr']:.1e} | {elapsed:.0f}s"
         )
 
         if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
-            # Save EMA weights as the checkpoint when EMA is active
-            state_to_save = ema.state_dict() if ema is not None else model.state_dict()
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": state_to_save,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-            }, os.path.join(cfg.MODEL_DIR, "best_unified_crossmodal.pt"))
-            print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap:.2%})")
+            if accelerator.is_main_process:
+                state_to_save = ema.state_dict() if ema is not None else accelerator.unwrap_model(model).state_dict()
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": state_to_save,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }, os.path.join(cfg.MODEL_DIR, "best_unified_crossmodal.pt"))
+                print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap_percent/100:.2%})")
+            accelerator.wait_for_everyone()
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
@@ -1260,7 +1191,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
 
 
 history = train_model(model, train_loader, test_loader, optimizer, scheduler,
-                      criterion, scaler, cfg, DEVICE, ema=ema)
+                      criterion, cfg, DEVICE, ema=ema)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 11: Load Best Model & Full Evaluation
@@ -1268,8 +1199,8 @@ history = train_model(model, train_loader, test_loader, optimizer, scheduler,
 
 best_path = os.path.join(cfg.MODEL_DIR, "best_unified_crossmodal.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
-model.load_state_dict(checkpoint["model_state_dict"])
-model = model.to(DEVICE)
+unwrapped = accelerator.unwrap_model(model)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 print(f"Loaded best model from epoch {checkpoint['epoch']} "
       f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
@@ -1278,46 +1209,52 @@ print(f"Loaded best model from epoch {checkpoint['epoch']} "
 @torch.no_grad()
 def full_evaluation(model, test_loader, class_names, device):
     all_preds, all_targets, all_probs = [], [], []
-    for batch in tqdm(test_loader, desc="  Evaluating"):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
+    for batch in tqdm(test_loader, desc="  Evaluating", disable=not accelerator.is_main_process):
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
         labels = batch["labels"]
         with autocast(enabled=(device.type == "cuda")):
             logits = model(input_ids, attention_mask, shape_features)
         probs = torch.softmax(logits.float(), dim=1)
         _, preds = logits.max(1)
-        all_preds.extend(preds.cpu().numpy())
-        all_targets.extend(labels.numpy())
-        all_probs.extend(probs.cpu().numpy())
+
+        # Gather
+        preds_g, labels_g, probs_g = accelerator.gather_for_metrics((preds, labels, probs))
+
+        all_preds.extend(preds_g.cpu().numpy())
+        all_targets.extend(labels_g.cpu().numpy())
+        all_probs.extend(probs_g.cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
     all_probs = np.array(all_probs)
 
-    print("\n" + "=" * 60)
-    print("CLASSIFICATION REPORT")
-    print("=" * 60)
-    report_str = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
-    print(report_str)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("CLASSIFICATION REPORT")
+        print("=" * 60)
+        report_str = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
+        print(report_str)
 
-    report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
-    with open(report_path, "w") as f:
-        f.write("CLASSIFICATION REPORT -- Unified Cross-Modal Attention (Script 16)\n")
-        f.write("=" * 60 + "\n")
-        f.write(report_str)
-    print(f"  -> Report saved: {report_path}")
+        report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
+        with open(report_path, "w") as f:
+            f.write("CLASSIFICATION REPORT -- Unified Cross-Modal Attention (Script 16)\n")
+            f.write("=" * 60 + "\n")
+            f.write(report_str)
+        print(f"  -> Report saved: {report_path}")
 
-    acc = accuracy_score(all_targets, all_preds)
-    f1_macro = f1_score(all_targets, all_preds, average="macro")
-    print(f"Overall Accuracy:  {acc:.4f}")
-    print(f"Macro F1-Score:    {f1_macro:.4f}")
+        acc = accuracy_score(all_targets, all_preds)
+        f1_macro = f1_score(all_targets, all_preds, average="macro")
+        print(f"Overall Accuracy:  {acc:.4f}")
+        print(f"Macro F1-Score:    {f1_macro:.4f}")
+
     return all_preds, all_targets, all_probs
 
 
 all_preds, all_targets, all_probs = full_evaluation(model, test_loader, cfg.CLASS_NAMES, DEVICE)
 
-# ── Export BED files for IGV Analysis ──
+# BED export
 def parse_header_to_bed(header):
     try:
         clean_hdr = header.split("_")[0]
@@ -1348,8 +1285,9 @@ def export_igv_bed_files(headers_test, predictions, targets, output_dir):
         print(f"    {name}.bed: {len(lines)} lines")
 
 
-print("\n  BED files for IGV:")
-export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
+if accelerator.is_main_process:
+    print("\n  BED files for IGV:")
+    export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 12: Generate All Performance Figures
@@ -1481,15 +1419,16 @@ def plot_per_class_metrics_bar(all_targets, all_preds, class_names, save_dir):
     print(f"  -> Per-class metrics: {path}")
 
 
-print("\n" + "=" * 60)
-print("GENERATING PERFORMANCE FIGURES")
-print("=" * 60)
-plot_training_curves(history, cfg.FIG_DIR)
-plot_confusion_matrix(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_roc_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_precision_recall_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_per_class_metrics_bar(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
-print("\nAll figures saved to:", cfg.FIG_DIR)
+if accelerator.is_main_process:
+    print("\n" + "=" * 60)
+    print("GENERATING PERFORMANCE FIGURES")
+    print("=" * 60)
+    plot_training_curves(history, cfg.FIG_DIR)
+    plot_confusion_matrix(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_roc_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_precision_recall_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_per_class_metrics_bar(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    print("\nAll figures saved to:", cfg.FIG_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 13: Summary
@@ -1500,35 +1439,11 @@ print("PIPELINE SUMMARY -- Unified Cross-Modal Attention (Script 16)")
 print("=" * 60)
 print(f"  DNABERT-2:         Last {cfg.UNFREEZE_LAST_N_LAYERS} layers fine-tuned "
       f"(layer-wise LR decay={cfg.USE_LAYERWISE_LR_DECAY})")
-print(f"  Max token length:  {MAX_LENGTH} (was 512 in Scripts 14/15)")
+print(f"  Max token length:  {MAX_LENGTH}")
 print(f"  Cross-Attention:   {cfg.CROSS_ATTN_LAYERS} layer(s), {cfg.CROSS_ATTN_NHEAD} heads, d={cfg.CROSS_ATTN_D_MODEL}")
 print(f"  Shape pos-embed:   {cfg.USE_SHAPE_POS_EMBED} | Attn-pooling: {cfg.USE_ATTENTION_POOLING}")
 print(f"  Head:              {cfg.HEAD_TYPE.upper()} (hidden={cfg.HIDDEN_DIM}) | Loss: {cfg.LOSS_TYPE}(gamma={cfg.FOCAL_GAMMA})")
-print(f"  EMA:               {cfg.USE_EMA} (decay={cfg.EMA_DECAY})")
+print(f"  EMA:               {cfg.USE_EMA}")
 print(f"  Best val acc:      {max(history['val_acc']):.4f}")
 print(f"  Model saved to:    {cfg.MODEL_DIR}")
 print()
-print("  +-----------------------------------------------------------+")
-print("  |  Script 14 (Cross-Modal):     61.33%  (overfit, gap 31%)  |")
-print("  |  Script 15 (KAN, 11 changes): 53.43%  (over-regularized)  |")
-print(f"  |  Script 16 (Unified):         {max(history['val_acc']):.2%}                      |")
-print("  +-----------------------------------------------------------+")
-print("=" * 60)
-
-# ═══════════════════════════════════════════════════════════════════════
-# CELL 14: Zip Outputs for Easy Kaggle Download
-# ═══════════════════════════════════════════════════════════════════════
-
-import shutil
-from IPython.display import FileLink
-
-zip_filename = "outputs_unified_crossmodal"
-shutil.make_archive(zip_filename, 'zip', cfg.OUTPUT_DIR)
-print(f"\nAll outputs zipped into: {zip_filename}.zip")
-
-try:
-    from IPython.display import display
-    display(FileLink(f"{zip_filename}.zip"))
-except ImportError:
-    print(f"FileLink not available. Please download {zip_filename}.zip from the Kaggle output panel.")
-

@@ -66,6 +66,15 @@ install_packages()
 # ═══════════════════════════════════════════════════════════════════════
 
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 import gc
 import time
 import random
@@ -79,7 +88,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
@@ -140,6 +148,7 @@ class Config:
     PATIENCE = 7           # Early stopping patience
     LR_PATIENCE = 3        # ReduceLROnPlateau patience
     LR_FACTOR = 0.5
+    GRAD_ACCUM_STEPS = 1   # Set to 1 for consistency since script 09 doesn't accumulate gradients
 
     # ── Data Split ──
     TEST_SIZE = 0.2
@@ -161,7 +170,21 @@ torch.manual_seed(cfg.RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.RANDOM_SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
+    kwargs_handlers=[ddp_kwargs],
+)
+DEVICE = accelerator.device
+
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
 print(f"\nUsing device: {DEVICE}")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -345,6 +368,7 @@ def patch_flash_attention():
         print(f"  ✅ Patched {patched} flash-attention references → pure PyTorch.")
     else:
         print("  ⚠️  No flash-attention references found to patch (may already be clean).")
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 5: Load DNABERT-2 Backbone
@@ -634,7 +658,6 @@ def train_mcnn(model, train_loader, val_loader, cfg, device):
     print("TRAINING mCNN HEAD")
     print("=" * 60)
 
-    model = model.to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(
         model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY
@@ -642,10 +665,14 @@ def train_mcnn(model, train_loader, val_loader, cfg, device):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=cfg.LR_PATIENCE, factor=cfg.LR_FACTOR
     )
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_val_loss = float("inf")
+    best_val_acc = 0.0
     patience_counter = 0
 
     for epoch in range(cfg.EPOCHS):
@@ -653,47 +680,55 @@ def train_mcnn(model, train_loader, val_loader, cfg, device):
 
         # ── Training ──
         model.train()
-        running_loss, correct, total = 0.0, 0, 0
+        train_loss_sum, train_total = 0.0, 0
+        all_train_preds, all_train_targets = [], []
 
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
+            with accelerator.accumulate(model):
+                with accelerator.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
 
-            with autocast(enabled=(device.type == "cuda")):
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                accelerator.backward(loss)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            running_loss += loss.item() * targets.size(0)
             _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, targets))
+            loss_gathered = accelerator.gather(loss).mean().item()
 
-        train_loss = running_loss / total
-        train_acc = correct / total
+            train_loss_sum += loss_gathered * targets_gathered.size(0)
+            train_total += targets_gathered.size(0)
+            all_train_preds.extend(preds_gathered.cpu().numpy())
+            all_train_targets.extend(targets_gathered.cpu().numpy())
+
+        train_loss = train_loss_sum / train_total
+        train_acc = accuracy_score(all_train_targets, all_train_preds)
 
         # ── Validation ──
         model.eval()
-        val_loss_sum, val_correct, val_total = 0.0, 0, 0
+        val_loss_sum, val_total = 0.0, 0
+        all_val_preds, all_val_targets = [], []
 
         with torch.no_grad():
             for inputs, targets in val_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-
-                with autocast(enabled=(device.type == "cuda")):
+                with accelerator.autocast():
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
 
-                val_loss_sum += loss.item() * targets.size(0)
                 _, predicted = outputs.max(1)
-                val_total += targets.size(0)
-                val_correct += predicted.eq(targets).sum().item()
+                preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, targets))
+                loss_gathered = accelerator.gather(loss).mean().item()
+
+                val_loss_sum += loss_gathered * targets_gathered.size(0)
+                val_total += targets_gathered.size(0)
+                all_val_preds.extend(preds_gathered.cpu().numpy())
+                all_val_targets.extend(targets_gathered.cpu().numpy())
 
         val_loss = val_loss_sum / val_total
-        val_acc = val_correct / val_total
+        val_acc = accuracy_score(all_val_targets, all_val_preds)
 
         scheduler.step(val_loss)
         elapsed = time.time() - t0
@@ -703,28 +738,40 @@ def train_mcnn(model, train_loader, val_loader, cfg, device):
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        lr_now = optimizer.param_groups[0]["lr"]
+        backbone_lr = optimizer.param_groups[0]["lr"]
+        gap_percent = (train_acc - val_acc) * 100
         print(
-            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} │ "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} │ "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f} │ "
-            f"LR: {lr_now:.2e} │ {elapsed:.1f}s"
+            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
+            f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+            f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+            f"Gap: {gap_percent:+.2f}% | "
+            f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
         )
 
         # ── Checkpointing & Early Stopping ──
-        if val_loss < best_val_loss:
+        accelerator.wait_for_everyone()
+        if val_acc > best_val_acc:
             best_val_loss = val_loss
+            best_val_acc = val_acc
             patience_counter = 0
             ckpt_path = os.path.join(cfg.MODEL_DIR, "best_dnabert2_mcnn.pt")
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"  → Saved best model (val_loss={val_loss:.4f})")
+            if accelerator.is_main_process:
+                unwrapped = accelerator.unwrap_model(model)
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": unwrapped.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }, ckpt_path)
+                print(f"  → Saved best model (val_acc={val_acc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
                 print(f"\n  ⏹ Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
+        accelerator.wait_for_everyone()
 
-    print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
+    print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
@@ -749,8 +796,10 @@ history = train_mcnn(mcnn, train_loader, test_loader, cfg, DEVICE)
 
 # Load best checkpoint
 best_path = os.path.join(cfg.MODEL_DIR, "best_dnabert2_mcnn.pt")
-mcnn.load_state_dict(torch.load(best_path, map_location=DEVICE))
-mcnn = mcnn.to(DEVICE)
+checkpoint = torch.load(best_path, map_location=DEVICE)
+unwrapped = accelerator.unwrap_model(mcnn)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
+mcnn = unwrapped
 mcnn.eval()
 print(f"Loaded best model from {best_path}")
 
@@ -762,14 +811,18 @@ def full_evaluation(model, test_loader, class_names, device):
     with torch.no_grad():
         for inputs, targets in test_loader:
             inputs = inputs.to(device)
-            with autocast(enabled=(device.type == "cuda")):
+            with accelerator.autocast():
                 outputs = model(inputs)
             probs = torch.softmax(outputs.float(), dim=1)
             _, preds = outputs.max(1)
 
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(targets.numpy())
-            all_probs.extend(probs.cpu().numpy())
+            # Gather predictions, labels, and probabilities across processes
+            preds_gathered, targets_gathered = accelerator.gather_for_metrics((preds, targets))
+            probs_gathered = accelerator.gather_for_metrics(probs)
+
+            all_preds.extend(preds_gathered.cpu().numpy())
+            all_targets.extend(targets_gathered.cpu().numpy())
+            all_probs.extend(probs_gathered.cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)

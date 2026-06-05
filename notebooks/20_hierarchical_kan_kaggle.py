@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 """
-Script 19: G-CMAB Safe Core — Incremental Improvements on Script 18 Baseline
+Script 19/20: G-CMAB Safe Core — Incremental Improvements on Script 18 Baseline
 Designed for: Kaggle GPU (1×T4 or 2×T4 via HuggingFace Accelerate)
 Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
-
-BUILD PHILOSOPHY (Lessons from Scripts 15→18):
-  - Script 16 collapsed to 25% by changing 11 things at once.
-  - Each improvement here is an independent flag — test one at a time.
-  - Keep Script 18 core (d_model=128, 1 cross-attn, weighted-CE, no pos-embed/EMA).
-
-SAFE IMPROVEMENTS (4 flags):
-  1. USE_STRIDED_CONV = True   — Strided Conv replaces MaxPool in shape CNN
-  2. USE_GROUPNORM   = True   — GroupNorm replaces BatchNorm (multi-GPU safe)
-  3. USE_LAYER_ATTN  = True   — Scalar-mix over multiple BERT layers (ELMo-style)
-  4. USE_MULTI_POOL  = True   — seq: mean‖max pooling, shape: K-Max(k=4) pooling
-
-Multi-GPU via HuggingFace Accelerate (automatic, no code change needed for 1-GPU).
 """
+
+# Suppress Hugging Face warnings and tokenizers parallelism messages
+import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 0: Install Dependencies
@@ -34,13 +26,15 @@ def install_packages():
         "accelerate>=0.25.0",
         "safetensors>=0.4.0",
     ]
-    for pkg in packages:
-        try:
-            pkg_name = pkg.split(">=")[0].split("==")[0]
-            __import__(pkg_name)
-        except ImportError:
-            print(f"Installing {pkg}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+    # Only run pip install on local rank 0 to avoid race conditions
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        for pkg in packages:
+            try:
+                pkg_name = pkg.split(">=")[0].split("==")[0]
+                __import__(pkg_name)
+            except ImportError:
+                print(f"Installing {pkg}...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 install_packages()
 
@@ -48,11 +42,15 @@ install_packages()
 # CELL 1: Imports
 # ═══════════════════════════════════════════════════════════════════════
 
-import os
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 import gc
 import copy
 import math
-import torch.nn.functional as F
 import time
 import random
 import warnings
@@ -87,18 +85,6 @@ from tqdm import tqdm
 # ── HuggingFace Accelerate ──
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-
-print(f"PyTorch version: {torch.__version__}")
-print(f"CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    try:
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
-    except AttributeError:
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    n_gpus = torch.cuda.device_count()
-    print(f"Number of GPUs: {n_gpus}")
-    torch.backends.cudnn.benchmark = True
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 2: Configuration
@@ -177,10 +163,6 @@ class Config:
     SHAPE_CONV_CHANNELS = [32, 64, 128]
     SHAPE_LR = 3e-4
 
-    # ══════════════════════════════════════════════════════════════════
-    # SCRIPT 19 FLAGS — each toggleable independently for ablation
-    # ══════════════════════════════════════════════════════════════════
-
     # Flag 1: Strided Conv replaces MaxPool in shape CNN
     USE_STRIDED_CONV = True
 
@@ -195,8 +177,6 @@ class Config:
     # Flag 4: Multi-statistic pooling (seq: mean‖max, shape: K-Max)
     USE_MULTI_POOL = True
     KMAX_K = 4
-
-    # ══════════════════════════════════════════════════════════════════
 
     # ── Hierarchical Head ──
     LOSS_ALPHA = 0.5        # Total_Loss = (1-ALPHA)*Binary + ALPHA*Triclass
@@ -217,8 +197,7 @@ class Config:
 
     # ── Training ──
     BATCH_SIZE = 64
-    # With 2×T4 Accelerate: effective batch = 64×2 = 128
-    GRAD_ACCUM_STEPS = 1  # Accelerate handles multi-GPU; set >1 for single GPU if desired
+    GRAD_ACCUM_STEPS = 1
     EPOCHS = 30
     PATIENCE = 12
     WARMUP_RATIO = 0.25
@@ -262,16 +241,20 @@ accelerator = Accelerator(
 )
 DEVICE = accelerator.device
 
-if accelerator.is_main_process:
-    print(f"\nUsing device: {DEVICE}")
-    print(f"Num processes: {accelerator.num_processes}")
-    print(f"Architecture: Hierarchical KAN (Script 20)")
-    print(f"  Base: Script 18 (d_model={cfg.CROSS_ATTN_D_MODEL}, 1 cross-attn, weighted-CE)")
-    print(f"  Flag 1 — Strided Conv:   {cfg.USE_STRIDED_CONV}")
-    print(f"  Flag 2 — GroupNorm:       {cfg.USE_GROUPNORM}")
-    print(f"  Flag 3 — Layer-Attention: {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N})")
-    print(f"  Flag 4 — Multi-Pool:      {cfg.USE_MULTI_POOL} (K-Max k={cfg.KMAX_K})")
-    print("=" * 60)
+# Override print for non-main processes globally
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
+print(f"\nUsing device: {DEVICE}")
+print(f"Num processes: {accelerator.num_processes}")
+print(f"Architecture: Hierarchical KAN (Script 20)")
+print(f"  Base: Script 18 (d_model={cfg.CROSS_ATTN_D_MODEL}, 1 cross-attn, weighted-CE)")
+print(f"  Flag 1 — Strided Conv:   {cfg.USE_STRIDED_CONV}")
+print(f"  Flag 2 — GroupNorm:       {cfg.USE_GROUPNORM}")
+print(f"  Flag 3 — Layer-Attention: {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N})")
+print(f"  Flag 4 — Multi-Pool:      {cfg.USE_MULTI_POOL} (K-Max k={cfg.KMAX_K})")
+print("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 3: Data Loading (Sequences + DNAshape Features)
@@ -315,8 +298,7 @@ def load_shape_features(data_dir, shape_files):
             break
     if not neg_shape_path:
         raise FileNotFoundError("Could not find any negative DNAshape file among candidates.")
-    if accelerator.is_main_process:
-        print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
+    print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
 
     resolved_paths = {}
     for cls_name, fname in shape_files.items():
@@ -330,8 +312,7 @@ def load_shape_features(data_dir, shape_files):
 
     for cls_name, fpath in resolved_paths.items():
         shape_data = np.load(fpath)
-        if accelerator.is_main_process:
-            print(f"  {cls_name} shape: {shape_data.shape} ({os.path.basename(fpath)})")
+        print(f"  {cls_name} shape: {shape_data.shape} ({os.path.basename(fpath)})")
         all_shapes.append(shape_data)
 
     return np.concatenate(all_shapes, axis=0)
@@ -339,10 +320,9 @@ def load_shape_features(data_dir, shape_files):
 
 def load_all_data(fasta_dir, shape_dir, shape_files):
     """Load all 4 classes: sequences + shape features + group-aware labels."""
-    if accelerator.is_main_process:
-        print("=" * 60)
-        print("LOADING DATASETS (Sequences + DNAshape Features)")
-        print("=" * 60)
+    print("=" * 60)
+    print("LOADING DATASETS (Sequences + DNAshape Features)")
+    print("=" * 60)
 
     neg_fasta_path = None
     fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
@@ -353,8 +333,7 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
             break
     if not neg_fasta_path:
         raise FileNotFoundError("Could not find any negative FASTA file among candidates.")
-    if accelerator.is_main_process:
-        print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
+    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
 
     fasta_files = {
         "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
@@ -371,8 +350,7 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
 
     for cls_idx, (cls_name, fpath) in enumerate(fasta_files.items()):
         seqs, hdrs = load_fasta(fpath)
-        if accelerator.is_main_process:
-            print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
+        print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
         all_sequences.extend(seqs)
         all_headers.extend(hdrs)
         all_labels.extend([cls_idx] * len(seqs))
@@ -389,27 +367,24 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     all_labels = np.array(all_labels)
     all_groups = np.array(all_groups)
 
-    if accelerator.is_main_process:
-        print("\n  Loading DNAshape features...")
+    print("\n  Loading DNAshape features...")
     all_shapes = load_shape_features(shape_dir, shape_files)
 
     assert len(all_sequences) == all_shapes.shape[0], (
         f"Sequence count ({len(all_sequences)}) != shape count ({all_shapes.shape[0]})"
     )
 
-    if accelerator.is_main_process:
-        print(f"\n  Total: {len(all_sequences)} sequences, {group_id} groups")
-        print(f"  Shape features: {all_shapes.shape}")
-        print(f"  Class distribution: {np.bincount(all_labels)}")
+    print(f"\n  Total: {len(all_sequences)} sequences, {group_id} groups")
+    print(f"  Shape features: {all_shapes.shape}")
+    print(f"  Class distribution: {np.bincount(all_labels)}")
     return all_sequences, all_labels, all_groups, all_shapes, all_headers
 
 
 def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=42):
     """Group-aware train/test split (no revcomp leakage)."""
-    if accelerator.is_main_process:
-        print("\n" + "=" * 60)
-        print("SPLITTING DATA (GroupShuffleSplit — no revcomp leakage)")
-        print("=" * 60)
+    print("\n" + "=" * 60)
+    print("SPLITTING DATA (GroupShuffleSplit — no revcomp leakage)")
+    print("=" * 60)
 
     gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
     train_idx, test_idx = next(gss.split(sequences, labels, groups))
@@ -421,11 +396,10 @@ def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=4
     headers_train = [headers[i] for i in train_idx]
     headers_test = [headers[i] for i in test_idx]
 
-    if accelerator.is_main_process:
-        print(f"  Train: {len(seq_train)} sequences")
-        print(f"  Test:  {len(seq_test)} sequences")
-        print(f"  Train class dist: {np.bincount(y_train)}")
-        print(f"  Test  class dist: {np.bincount(y_test)}")
+    print(f"  Train: {len(seq_train)} sequences")
+    print(f"  Test:  {len(seq_test)} sequences")
+    print(f"  Train class dist: {np.bincount(y_train)}")
+    print(f"  Test  class dist: {np.bincount(y_test)}")
     return seq_train, seq_test, y_train, y_test, shape_train, shape_test, headers_train, headers_test
 
 
@@ -445,10 +419,9 @@ gc.collect()
 
 def robust_normalize_shapes(shape_train, shape_test):
     """Apply Robust Scaler normalization per channel. Stats from TRAINING SET ONLY."""
-    if accelerator.is_main_process:
-        print("\n" + "=" * 60)
-        print("NORMALIZING DNAshape FEATURES (Robust Scaler P1-P99)")
-        print("=" * 60)
+    print("\n" + "=" * 60)
+    print("NORMALIZING DNAshape FEATURES (Robust Scaler P1-P99)")
+    print("=" * 60)
 
     n_channels = shape_train.shape[1]
     channel_names = ["MGW", "ProT", "Roll", "HelT", "EP"]
@@ -463,17 +436,15 @@ def robust_normalize_shapes(shape_train, shape_test):
         scale = max(p99_val - p1_val, 1e-9)
         shape_train_norm[:, ch, :] = (shape_train_norm[:, ch, :] - median_val) / scale
         shape_test_norm[:, ch, :] = (shape_test_norm[:, ch, :] - median_val) / scale
-        if accelerator.is_main_process:
-            print(f"  {channel_names[ch]:>5s}: median={median_val:>8.4f}, "
-                  f"P1={p1_val:>8.4f}, P99={p99_val:>8.4f}, scale={scale:>8.4f}")
+        print(f"  {channel_names[ch]:>5s}: median={median_val:>8.4f}, "
+              f"P1={p1_val:>8.4f}, P99={p99_val:>8.4f}, scale={scale:>8.4f}")
 
     nan_train = np.isnan(shape_train_norm).sum()
     nan_test = np.isnan(shape_test_norm).sum()
     shape_train_norm = np.nan_to_num(shape_train_norm, nan=0.0)
     shape_test_norm = np.nan_to_num(shape_test_norm, nan=0.0)
-    if accelerator.is_main_process:
-        print(f"\n  NaN filled with 0: train={nan_train}, test={nan_test}")
-        print(f"  Train shape range: [{shape_train_norm.min():.4f}, {shape_train_norm.max():.4f}]")
+    print(f"\n  NaN filled with 0: train={nan_train}, test={nan_test}")
+    print(f"  Train shape range: [{shape_train_norm.min():.4f}, {shape_train_norm.max():.4f}]")
     return shape_train_norm, shape_test_norm
 
 
@@ -541,9 +512,8 @@ def patch_flash_attention():
                 if hasattr(mod, attr_name):
                     setattr(mod, attr_name, replacement)
                     patched += 1
-    if accelerator.is_main_process:
-        print(f"  Patched {patched} flash-attention refs -> pure PyTorch."
-              if patched else "  No flash-attn refs to patch.")
+    print(f"  Patched {patched} flash-attention refs -> pure PyTorch."
+          if patched else "  No flash-attn refs to patch.")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 6: Load DNABERT-2 Backbone (with Selective Unfreezing)
@@ -553,10 +523,9 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
     """Load DNABERT-2 with selective layer unfreezing.
     Returns model on CPU — Accelerate will handle device placement.
     """
-    if accelerator.is_main_process:
-        print("\n" + "=" * 60)
-        print("LOADING DNABERT-2 BACKBONE (Selective Fine-Tuning)")
-        print("=" * 60)
+    print("\n" + "=" * 60)
+    print("LOADING DNABERT-2 BACKBONE (Selective Fine-Tuning)")
+    print("=" * 60)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
@@ -578,18 +547,15 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
         for name, buf in model.named_buffers():
             if buf.device == torch.device("meta"):
                 raise RuntimeError(f"Buffer {name} on meta device")
-        if accelerator.is_main_process:
-            print("  Strategy 1 (direct load) OK")
+        print("  Strategy 1 (direct load) OK")
     except Exception as e:
-        if accelerator.is_main_process:
-            print(f"  Strategy 1 failed: {e}")
+        print(f"  Strategy 1 failed: {e}")
         model = None
 
     # Strategy 2: Empty init + manual state_dict
     if model is None:
         try:
-            if accelerator.is_main_process:
-                print("  Trying Strategy 2 (empty init + state_dict)...")
+            print("  Trying Strategy 2 (empty init + state_dict)...")
             from huggingface_hub import hf_hub_download
             with torch.no_grad():
                 model = AutoModel.from_config(config, trust_remote_code=True)
@@ -606,18 +572,15 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
                 if ck in set(result.missing_keys):
                     raise RuntimeError(f"Core weight '{ck}' missing!")
             model = model.to("cpu")
-            if accelerator.is_main_process:
-                print("  Strategy 2 OK")
+            print("  Strategy 2 OK")
         except Exception as e:
-            if accelerator.is_main_process:
-                print(f"  Strategy 2 failed: {e}")
+            print(f"  Strategy 2 failed: {e}")
             model = None
 
     # Strategy 3: Monkey-patch torch.empty meta->cpu
     if model is None:
         try:
-            if accelerator.is_main_process:
-                print("  Trying Strategy 3 (monkey-patch ALiBi)...")
+            print("  Trying Strategy 3 (monkey-patch ALiBi)...")
             _orig = torch.empty
             def _patched(*a, **kw):
                 if kw.get("device") == torch.device("meta") or str(kw.get("device", "")) == "meta":
@@ -628,8 +591,7 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
                 model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=True, low_cpu_mem_usage=False)
             finally:
                 torch.empty = _orig
-            if accelerator.is_main_process:
-                print("  Strategy 3 OK")
+            print("  Strategy 3 OK")
         except Exception as e:
             raise RuntimeError(f"All loading strategies failed: {e}") from e
 
@@ -648,13 +610,12 @@ def load_dnabert2(model_name, unfreeze_last_n=6):
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    if accelerator.is_main_process:
-        print(f"\n  DNABERT-2 loaded")
-        print(f"  Total encoder layers: {total_layers}")
-        print(f"  Frozen: layers 0-{unfreeze_from-1} | Unfrozen: layers {unfreeze_from}-{total_layers-1} ({unfreeze_last_n})")
-        print(f"  Total: {total_params:,} | Trainable: {trainable:,} ({100*trainable/total_params:.1f}%)")
-        if cfg.USE_LAYER_ATTN:
-            print(f"  Layer-Attention: mixing last {cfg.LAYER_ATTN_N} hidden states")
+    print(f"\n  DNABERT-2 loaded")
+    print(f"  Total encoder layers: {total_layers}")
+    print(f"  Frozen: layers 0-{unfreeze_from-1} | Unfrozen: layers {unfreeze_from}-{total_layers-1} ({unfreeze_last_n})")
+    print(f"  Total: {total_params:,} | Trainable: {trainable:,} ({100*trainable/total_params:.1f}%)")
+    if cfg.USE_LAYER_ATTN:
+        print(f"  Layer-Attention: mixing last {cfg.LAYER_ATTN_N} hidden states")
     return model, tokenizer
 
 
@@ -671,14 +632,13 @@ def compute_max_token_length(sequences, tok, sample_size=2000, percentile=99, fl
     lengths = [len(tok(s, add_special_tokens=True)["input_ids"]) for s in sample]
     p_val = int(np.percentile(lengths, percentile))
     chosen = int(max(floor, min(cap, p_val + 2)))
-    if accelerator.is_main_process:
-        print("\n" + "=" * 60)
-        print("AUTO MAX TOKEN LENGTH")
-        print("=" * 60)
-        print(f"  Token length (sample n={len(sample)}): "
-              f"min={min(lengths)}, mean={np.mean(lengths):.1f}, "
-              f"p{percentile}={p_val}, max={max(lengths)}")
-        print(f"  Chosen MAX_TOKEN_LENGTH = {chosen}")
+    print("\n" + "=" * 60)
+    print("AUTO MAX TOKEN LENGTH")
+    print("=" * 60)
+    print(f"  Token length (sample n={len(sample)}): "
+          f"min={min(lengths)}, mean={np.mean(lengths):.1f}, "
+          f"p{percentile}={p_val}, max={max(lengths)}")
+    print(f"  Chosen MAX_TOKEN_LENGTH = {chosen}")
     return chosen
 
 if cfg.AUTO_MAX_LENGTH:
@@ -688,8 +648,7 @@ if cfg.AUTO_MAX_LENGTH:
     )
 else:
     MAX_LENGTH = cfg.MAX_TOKEN_LENGTH
-    if accelerator.is_main_process:
-        print(f"\n  Using fixed MAX_TOKEN_LENGTH = {MAX_LENGTH}")
+    print(f"\n  Using fixed MAX_TOKEN_LENGTH = {MAX_LENGTH}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 7: Architecture — G-CMAB Safe Core
@@ -848,10 +807,7 @@ class CrossModalAttentionLayer(nn.Module):
         return seq_out, shape_out
 
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# CELL X: Chebyshev KAN Layer
-# ═══════════════════════════════════════════════════════════════════════
+# ---------- Chebyshev KAN Layer ----------
 
 class ChebyKANLinear(nn.Module):
     """
@@ -887,7 +843,7 @@ class ChebyKANLinear(nn.Module):
 
 class HierarchicalKANModel(nn.Module):
     """
-    Script 19: G-CMAB Safe Core Classifier.
+    Script 19/20: G-CMAB Safe Core Classifier.
     Builds on Script 18 with 4 independently togglable improvements.
     """
     def __init__(self, backbone, cfg):
@@ -947,7 +903,7 @@ class HierarchicalKANModel(nn.Module):
             nn.Dropout(p=cfg.FUSION_DROPOUT),
             nn.Linear(128, 2)
         )
-        
+
         # Head 2: Tri-class (SP1 vs SP2 vs SP4) - KAN
         self.triclass_head = nn.Sequential(
             nn.LayerNorm(fusion_dim),
@@ -975,12 +931,10 @@ class HierarchicalKANModel(nn.Module):
                     return self.layer_attention(selected)
                 else:
                     # Fallback: hidden_states not available in output
-                    if accelerator.is_main_process:
-                        print("  [LayerAttn] WARNING: hidden_states not in output, using hook fallback...")
+                    print("  [LayerAttn] WARNING: hidden_states not in output, using hook fallback...")
                     self._layer_attn_fallback = True
             except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"  [LayerAttn] WARNING: output_hidden_states failed ({e}), using hook fallback...")
+                print(f"  [LayerAttn] WARNING: output_hidden_states failed ({e}), using hook fallback...")
                 self._layer_attn_fallback = True
 
         if self.use_layer_attn and getattr(self, '_layer_attn_fallback', False):
@@ -992,7 +946,6 @@ class HierarchicalKANModel(nn.Module):
 
             def make_hook(storage):
                 def hook_fn(module, input, output):
-                    # output is typically (hidden_states, ...) or just hidden_states
                     if isinstance(output, tuple):
                         storage.append(output[0])
                     else:
@@ -1030,24 +983,18 @@ class HierarchicalKANModel(nn.Module):
     def _masked_max_pool(self, features, attention_mask):
         """Masked max pooling over sequence dimension."""
         mask_expanded = attention_mask.unsqueeze(-1).float()
-        # Set padding positions to very large negative number
         features_masked = features.clone()
         features_masked[mask_expanded.squeeze(-1) == 0] = -1e9
         return features_masked.max(dim=1)[0]
 
     def _kmax_pool(self, features, k=4):
-        """K-Max pooling: average of top-k values along sequence dim, per feature.
-        More robust than pure Max (which is k=1) — captures top structural peaks
-        without being dominated by a single outlier.
-        """
-        # features: [B, L, D]
+        """K-Max pooling: average of top-k values along sequence dim, per feature."""
         k_actual = min(k, features.size(1))
-        # topk along dim=1
         topk_vals, _ = features.topk(k_actual, dim=1)  # [B, k, D]
         return topk_vals.mean(dim=1)  # [B, D]
 
     def forward(self, input_ids, attention_mask, shape_features):
-        # ── BERT feature extraction (with optional Layer-Attention) ──
+        # ── BERT feature extraction ──
         hidden_states = self._get_bert_features(input_ids, attention_mask)  # [B, T, 768]
         seq_features = self.seq_projection(hidden_states)  # [B, T, d_model]
 
@@ -1063,21 +1010,17 @@ class HierarchicalKANModel(nn.Module):
 
         # ── Pooling (Flag 4) ──
         if self.use_multi_pool:
-            # Seq: concat[masked_mean, masked_max] → 2*d_model
             seq_mean = self._masked_mean_pool(seq_features, attention_mask)
             seq_max = self._masked_max_pool(seq_features, attention_mask)
             seq_pooled = torch.cat([seq_mean, seq_max], dim=1)
-
-            # Shape: K-Max pooling → d_model
             shape_pooled = self._kmax_pool(shape_feats, k=self.kmax_k)
         else:
-            # Script 18 default
             mask_expanded = attention_mask.unsqueeze(-1).float()
             seq_pooled = (seq_features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
             shape_pooled = shape_feats.mean(dim=1)
 
         fused = torch.cat([seq_pooled, shape_pooled], dim=1)
-        
+
         # Hierarchical Classification
         logits_binary = self.binary_head(fused)
         logits_triclass = self.triclass_head(fused)
@@ -1121,9 +1064,8 @@ train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True
 test_loader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE * 2, shuffle=False,
                          num_workers=2, pin_memory=True)
 
-if accelerator.is_main_process:
-    print(f"\nDataLoaders ready: {len(train_loader)} train batches, {len(test_loader)} test batches")
-    print(f"Sequence max_length = {MAX_LENGTH}")
+print(f"\nDataLoaders ready: {len(train_loader)} train batches, {len(test_loader)} test batches")
+print(f"Sequence max_length = {MAX_LENGTH}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 9: Build Model, Optimizer, Loss
@@ -1133,7 +1075,6 @@ model = HierarchicalKANModel(backbone=dnabert_model, cfg=cfg)
 
 # ── Optimizer with component-specific learning rates ──
 param_groups = []
-
 backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
 param_groups.append({"params": backbone_params, "lr": cfg.BACKBONE_LR, "weight_decay": cfg.WEIGHT_DECAY})
 
@@ -1143,7 +1084,7 @@ param_groups.append({"params": list(model.cross_attention_layers.parameters()), 
 param_groups.append({"params": list(model.binary_head.parameters()), "lr": cfg.HEAD_LR, "weight_decay": cfg.WEIGHT_DECAY})
 param_groups.append({"params": list(model.triclass_head.parameters()), "lr": cfg.KAN_LR, "weight_decay": cfg.WEIGHT_DECAY})
 
-# Layer-Attention parameters (scalar-mix learns fast → higher LR)
+# Layer-Attention parameters
 if cfg.USE_LAYER_ATTN and model.layer_attention is not None:
     param_groups.append({"params": list(model.layer_attention.parameters()), "lr": cfg.LAYER_ATTN_LR, "weight_decay": 0.0})
 
@@ -1161,38 +1102,36 @@ def lr_lambda(current_step):
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-# Class weights for CrossEntropy Loss
+# Class weights
 class_counts = np.bincount(y_train)
 class_weights = len(y_train) / (len(class_counts) * class_counts.astype(np.float32))
-class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=accelerator.device)
+class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 
-if accelerator.is_main_process:
-    print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(len(class_counts))]))
+print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(len(class_counts))]))
 
 criterion = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=cfg.LABEL_SMOOTHING)
 
-# ── Prepare with Accelerate (handles DDP, AMP, device placement) ──
+# ── Prepare with Accelerate ──
 model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, test_loader, scheduler
 )
 
 # Model summary
 trainable_total = sum(p.numel() for g in param_groups for p in g["params"])
-if accelerator.is_main_process:
-    print(f"\n{'='*60}")
-    print("MODEL SUMMARY -- Hierarchical KAN (Script 20)")
-    print(f"{'='*60}")
-    print(f"  Trainable params:    {trainable_total:,}")
-    print(f"  d_model:             {cfg.CROSS_ATTN_D_MODEL}")
-    print(f"  Backbone LR:         {cfg.BACKBONE_LR}")
-    print(f"  Head LR:             {cfg.HEAD_LR}")
-    print(f"  Flag 1 Strided Conv: {cfg.USE_STRIDED_CONV}")
-    print(f"  Flag 2 GroupNorm:    {cfg.USE_GROUPNORM}")
-    print(f"  Flag 3 LayerAttn:   {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N}, LR={cfg.LAYER_ATTN_LR})")
-    print(f"  Flag 4 MultiPool:   {cfg.USE_MULTI_POOL} (kmax_k={cfg.KMAX_K})")
-    print(f"  Effective batch:     {cfg.BATCH_SIZE}×{accelerator.num_processes} = {cfg.BATCH_SIZE * accelerator.num_processes}")
-    print(f"  Grad accum steps:    {cfg.GRAD_ACCUM_STEPS}")
-    print(f"  Total / warmup:      {total_steps} / {warmup_steps}")
+print(f"\n{'='*60}")
+print("MODEL SUMMARY -- Hierarchical KAN (Script 20)")
+print(f"{'='*60}")
+print(f"  Trainable params:    {trainable_total:,}")
+print(f"  d_model:             {cfg.CROSS_ATTN_D_MODEL}")
+print(f"  Backbone LR:         {cfg.BACKBONE_LR}")
+print(f"  Head LR:             {cfg.HEAD_LR}")
+print(f"  Flag 1 Strided Conv: {cfg.USE_STRIDED_CONV}")
+print(f"  Flag 2 GroupNorm:    {cfg.USE_GROUPNORM}")
+print(f"  Flag 3 LayerAttn:   {cfg.USE_LAYER_ATTN} (N={cfg.LAYER_ATTN_N}, LR={cfg.LAYER_ATTN_LR})")
+print(f"  Flag 4 MultiPool:   {cfg.USE_MULTI_POOL} (kmax_k={cfg.KMAX_K})")
+print(f"  Effective batch:     {cfg.BATCH_SIZE}×{accelerator.num_processes} = {cfg.BATCH_SIZE * accelerator.num_processes}")
+print(f"  Grad accum steps:    {cfg.GRAD_ACCUM_STEPS}")
+print(f"  Total / warmup:      {total_steps} / {warmup_steps}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 10: Training Loop with Early Stopping + Gradient Monitoring
@@ -1217,21 +1156,18 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
         with accelerator_obj.accumulate(model):
             with accelerator_obj.autocast():
                 logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
-                
-                # ── Dual Loss Computation ──
+
                 # labels: 0=SP1, 1=SP2, 2=SP4, 3=Negative
                 # binary_labels: 1 if Positive (0,1,2), 0 if Negative (3)
                 binary_labels = (labels != 3).long()
                 loss_binary = F.cross_entropy(logits_binary, binary_labels)
-                
-                # Extract positive samples for tri-class head
+
                 positive_mask = (labels != 3)
                 if positive_mask.sum() > 0:
                     loss_triclass = F.cross_entropy(logits_triclass[positive_mask], labels[positive_mask], weight=criterion.weight[:3])
                 else:
                     loss_triclass = torch.tensor(0.0, device=labels.device)
-                
-                # Total Loss with ALPHA
+
                 loss = (1 - cfg.LOSS_ALPHA) * loss_binary + cfg.LOSS_ALPHA * loss_triclass
 
             accelerator_obj.backward(loss)
@@ -1247,22 +1183,26 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
             scheduler.step()
             optimizer.zero_grad()
 
-        running_loss += loss.item() * labels.size(0)
-        
-        # Joint probability prediction for train accuracy calculation
-        probs_binary = torch.softmax(logits_binary.detach().float(), dim=1)
-        probs_triclass = torch.softmax(logits_triclass.detach().float(), dim=1)
-        probs = torch.zeros(labels.size(0), 4, device=labels.device)
-        probs[:, 3] = probs_binary[:, 0]
-        for i in range(3):
-            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
-        predicted = probs.argmax(dim=1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        # Joint prediction for correct train accuracy
+        with torch.no_grad():
+            probs_binary = torch.softmax(logits_binary.float(), dim=1)
+            probs_triclass = torch.softmax(logits_triclass.float(), dim=1)
+            probs = torch.zeros(labels.size(0), 4, device=labels.device)
+            probs[:, 3] = probs_binary[:, 0]
+            for i in range(3):
+                probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
+            predicted = probs.argmax(dim=1)
+
+            # Gather metrics
+            predicted_g, labels_g, loss_g = accelerator_obj.gather_for_metrics((predicted, labels, loss.repeat(labels.size(0))))
+
+            running_loss += loss_g.sum().item()
+            total += labels_g.size(0)
+            correct += predicted_g.eq(labels_g).sum().item()
+
         if accelerator_obj.is_main_process:
             pbar.set_postfix({"loss": f"{running_loss/total:.4f}", "acc": f"{correct/total:.4f}"})
 
-    # Print gradient diagnostics for first few epochs
     if epoch_num < 5 and grad_norms and accelerator_obj.is_main_process:
         avg_norm = np.mean(grad_norms)
         max_norm_val = np.max(grad_norms)
@@ -1286,16 +1226,16 @@ def evaluate(model, loader, criterion, accelerator_obj):
         labels = batch["labels"]
         with accelerator_obj.autocast():
             logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
-            
+
             binary_labels = (labels != 3).long()
             loss_binary = F.cross_entropy(logits_binary, binary_labels)
-            
+
             positive_mask = (labels != 3)
             if positive_mask.sum() > 0:
                 loss_triclass = F.cross_entropy(logits_triclass[positive_mask], labels[positive_mask], weight=criterion.weight[:3])
             else:
                 loss_triclass = torch.tensor(0.0, device=labels.device)
-            
+
             loss = (1 - cfg.LOSS_ALPHA) * loss_binary + cfg.LOSS_ALPHA * loss_triclass
 
         # Joint Probabilities
@@ -1307,7 +1247,7 @@ def evaluate(model, loader, criterion, accelerator_obj):
             probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
         preds = probs.argmax(dim=1)
 
-        # Gather predictions across GPUs for correct accuracy
+        # Gather predictions across GPUs
         preds, labels_gathered = accelerator_obj.gather_for_metrics((preds, labels))
         loss_gathered = accelerator_obj.gather_for_metrics(loss.repeat(labels.size(0)))
 
@@ -1320,10 +1260,9 @@ def evaluate(model, loader, criterion, accelerator_obj):
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
                 criterion, accelerator_obj, cfg):
-    if accelerator_obj.is_main_process:
-        print("\n" + "=" * 60)
-        print("TRAINING -- Hierarchical KAN (Script 20)")
-        print("=" * 60)
+    print("\n" + "=" * 60)
+    print("TRAINING -- Hierarchical KAN (Script 20)")
+    print("=" * 60)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_val_acc = 0.0
@@ -1341,34 +1280,34 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         val_loss, val_acc = evaluate(model, test_loader, criterion, accelerator_obj)
 
         elapsed = time.time() - t0
-        gap = train_acc - val_acc
+        gap_percent = (train_acc - val_acc) * 100
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        # 1. Đồng bộ hóa trước khi in ấn và lưu checkpoint (tránh lệch pha đọc/ghi model parameters)
+        # Sync before save / print
         accelerator_obj.wait_for_everyone()
 
-        # 2. In ấn kết quả (chỉ chạy trên main process)
-        if accelerator_obj.is_main_process:
-            print(
-                f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
-                f"Train: {train_loss:.4f}/{train_acc:.4f} | "
-                f"Val: {val_loss:.4f}/{val_acc:.4f} | "
-                f"Gap: {gap:.2%} | LR: {optimizer.param_groups[0]['lr']:.1e} | {elapsed:.0f}s"
-            )
-            if epoch >= 3 and max(history["val_acc"]) < 0.30:
-                print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")
+        backbone_lr = optimizer.param_groups[0]['lr']
+        print(
+            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
+            f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+            f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+            f"Gap: {gap_percent:+.2f}% | "
+            f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
+        )
 
-        # 3. Cập nhật patience và quyết định early stopping trên mọi GPU (đồng bộ cờ dừng)
+        if epoch >= 3 and max(history["val_acc"]) < 0.30 and accelerator_obj.is_main_process:
+            print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")
+
         if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
-            
-            # Chỉ GPU 0 thực hiện ghi file checkpoint xuống đĩa
+
+            # Only main process saves checkpoint
             if accelerator_obj.is_main_process:
                 unwrapped = accelerator_obj.unwrap_model(model)
                 torch.save({
@@ -1383,19 +1322,17 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                         "USE_MULTI_POOL": cfg.USE_MULTI_POOL,
                     },
                 }, os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt"))
-                print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap:.2%})")
+                print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap_percent/100:.2%})")
+            accelerator_obj.wait_for_everyone()
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
-                if accelerator_obj.is_main_process:
-                    print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
+                print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
-
-        # 4. Đồng bộ hóa sau khi ghi checkpoint (để GPU 1 đợi GPU 0 hoàn tất ghi file trước khi sang epoch tiếp theo)
+        
         accelerator_obj.wait_for_everyone()
 
-    if accelerator_obj.is_main_process:
-        print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
+    print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
@@ -1403,21 +1340,20 @@ history = train_model(model, train_loader, test_loader, optimizer, scheduler,
                       criterion, accelerator, cfg)
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 11: Load Best Model & Full Evaluation (main process only)
+# CELL 11: Load Best Model & Full Evaluation (all processes load)
 # ═══════════════════════════════════════════════════════════════════════
 
-if accelerator.is_main_process:
-    best_path = os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt")
-    checkpoint = torch.load(best_path, map_location=accelerator.device)
-    unwrapped = accelerator.unwrap_model(model)
-    unwrapped.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded best model from epoch {checkpoint['epoch']} "
-          f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
+best_path = os.path.join(cfg.MODEL_DIR, "best_gcmab_safe.pt")
+checkpoint = torch.load(best_path, map_location=DEVICE)
+unwrapped = accelerator.unwrap_model(model)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+print(f"Loaded best model from epoch {checkpoint['epoch']} "
+      f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
 
 
 @torch.no_grad()
 def full_evaluation(model, test_loader, class_names, accelerator_obj):
-    model.eval()
     all_preds, all_targets, all_probs = [], [], []
     for batch in tqdm(test_loader, desc="  Evaluating", disable=not accelerator_obj.is_main_process):
         input_ids = batch["input_ids"]
@@ -1426,17 +1362,17 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
         labels = batch["labels"]
         with accelerator_obj.autocast():
             logits_binary, logits_triclass = model(input_ids, attention_mask, shape_features)
-        
+
         # Probabilities
         probs_binary = torch.softmax(logits_binary.float(), dim=1)
         probs_triclass = torch.softmax(logits_triclass.float(), dim=1)
-        
+
         # Joint Probabilities
         probs = torch.zeros(input_ids.size(0), 4, device=input_ids.device)
         probs[:, 3] = probs_binary[:, 0]  # P(Negative)
         for i in range(3):
-            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]  # P(Positive) * P(SP_i | Positive)
-            
+            probs[:, i] = probs_binary[:, 1] * probs_triclass[:, i]
+
         preds = probs.argmax(dim=1)
 
         preds_g, labels_g, probs_g = accelerator_obj.gather_for_metrics((preds, labels, probs))
@@ -1654,7 +1590,7 @@ if accelerator.is_main_process:
 
 if accelerator.is_main_process:
     print("\n" + "=" * 60)
-    print("PIPELINE SUMMARY -- G-CMAB Safe Core (Script 19)")
+    print("PIPELINE SUMMARY -- G-CMAB Safe Core (Script 19/20)")
     print("=" * 60)
     print(f"  DNABERT-2:          Last {cfg.UNFREEZE_LAST_N_LAYERS} layers fine-tuned")
     print(f"  Max token length:   {MAX_LENGTH}")
@@ -1670,15 +1606,6 @@ if accelerator.is_main_process:
     print(f"  Best val acc:       {max(history['val_acc']):.4f}")
     print(f"  Model saved to:     {cfg.MODEL_DIR}")
     print()
-    print("  +-----------------------------------------------------------+")
-    print("  |  Script 14 (Cross-Modal):     61.33%  (overfit, gap 31%)  |")
-    print("  |  Script 15 (KAN, 11 changes): 53.43%  (over-regularized)  |")
-    print("  |  Script 16 (Unified):         25%     (BROKEN: no learn)  |")
-    print("  |  Script 17 (v2 Bug Fix):      34.21%  (EMA lag & pos_emb) |")
-    print("  |  Script 18 (Simplified Core): 60.81%  (gap 25.57%)        |")
-    print(f"  |  Script 19 (G-CMAB Safe):    {max(history['val_acc']):.2%}                      |")
-    print("  +-----------------------------------------------------------+")
-    print("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 14: Zip Outputs for Easy Kaggle Download

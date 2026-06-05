@@ -67,6 +67,15 @@ install_packages()
 # ═══════════════════════════════════════════════════════════════════════
 
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 import gc
 import math
 import time
@@ -81,7 +90,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
@@ -173,13 +181,13 @@ class Config:
     SHAPE_CONV_CHANNELS = [32, 64, 128]  # Conv1D channel progression
     SHAPE_OUTPUT_DIM = 128        # Final shape embedding dimension
 
-    # ── Projection Layer (NEW — Technique A) ──
-    BERT_PROJ_DIM = 256           # ★ NEW: Compress BERT 1536 → 256
-    BERT_DROPOUT = 0.5            # ★ NEW: Heavy dropout on BERT branch (Technique C)
-    SHAPE_DROPOUT = 0.1           # ★ NEW: Light dropout on Shape branch (Technique C)
+    # ── Projection Layer ──
+    BERT_PROJ_DIM = 256           # Compress BERT 1536 → 256
+    BERT_DROPOUT = 0.5            # Heavy dropout on BERT branch
+    SHAPE_DROPOUT = 0.1           # Light dropout on Shape branch
 
     # ── Fusion Head ──
-    FUSION_DIM = 256 + 128        # ★ CHANGED: 256 (projected BERT) + 128 (Shape) = 384
+    FUSION_DIM = 256 + 128        # 256 (projected BERT) + 128 (Shape) = 384
     HIDDEN_DIM = 256
     DROPOUT_RATE = 0.3            # Fusion head dropout
     LABEL_SMOOTHING = 0.1
@@ -220,7 +228,21 @@ torch.manual_seed(cfg.RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.RANDOM_SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
+    kwargs_handlers=[ddp_kwargs],
+)
+DEVICE = accelerator.device
+
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
 print(f"\nUsing device: {DEVICE}")
 print(f"Architecture: Balanced Dual-Branch (DNABERT-2 + DNAshape CNN)")
 print(f"  ★ BERT Projection: 1536 → {cfg.BERT_PROJ_DIM}")
@@ -267,7 +289,6 @@ def load_shape_features(data_dir, shape_files):
     """
     all_shapes = []
     
-    # Dynamically find the negative shape file if it exists under another name
     neg_shape_path = None
     neg_candidates = ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]
     for cand in neg_candidates:
@@ -305,7 +326,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     print("LOADING DATASETS (Sequences + DNAshape Features)")
     print("=" * 60)
 
-    # Detect negative FASTA file
     neg_fasta_path = None
     fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
     for cand in fasta_candidates:
@@ -319,7 +339,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
 
     print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
 
-    # Build file paths for all classes
     fasta_files = {
         "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
         "SP2": find_file("sp2_positive_final.fasta", fasta_dir),
@@ -327,7 +346,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         "Negative": neg_fasta_path,
     }
 
-    # Verify all are resolved
     for cls_name, fpath in fasta_files.items():
         if not fpath:
             raise FileNotFoundError(f"Missing FASTA file for {cls_name}")
@@ -360,7 +378,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     all_labels = np.array(all_labels)
     all_groups = np.array(all_groups)
 
-    # Load shape features in the same class order
     print("\n  Loading DNAshape features...")
     all_shapes = load_shape_features(shape_dir, shape_files)
 
@@ -447,7 +464,6 @@ def robust_normalize_shapes(shape_train, shape_test):
     shape_test_norm = np.copy(shape_test).astype(np.float32)
 
     for ch in range(n_channels):
-        # Flatten channel across all train samples, ignoring NaN
         train_vals = shape_train[:, ch, :].flatten()
         valid_vals = train_vals[~np.isnan(train_vals)]
 
@@ -457,16 +473,14 @@ def robust_normalize_shapes(shape_train, shape_test):
         scale = p99_val - p1_val
 
         if scale < 1e-9:
-            scale = 1.0  # Safety: avoid division by zero
+            scale = 1.0
 
-        # Normalize
         shape_train_norm[:, ch, :] = (shape_train_norm[:, ch, :] - median_val) / scale
         shape_test_norm[:, ch, :] = (shape_test_norm[:, ch, :] - median_val) / scale
 
         print(f"  {channel_names[ch]:>5s}: median={median_val:>8.4f}, "
               f"P1={p1_val:>8.4f}, P99={p99_val:>8.4f}, scale={scale:>8.4f}")
 
-    # Fill NaN with 0 (median maps to 0 after robust scaling)
     nan_count_train = np.isnan(shape_train_norm).sum()
     nan_count_test = np.isnan(shape_test_norm).sum()
     shape_train_norm = np.nan_to_num(shape_train_norm, nan=0.0)
@@ -708,7 +722,7 @@ dnabert_model, tokenizer = load_dnabert2(
 )
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 7: Balanced DualBranch Architecture (★ KEY CHANGES)
+# CELL 7: Balanced DualBranch Architecture
 # ═══════════════════════════════════════════════════════════════════════
 
 class ShapeCNN(nn.Module):
@@ -749,7 +763,6 @@ class ShapeCNN(nn.Module):
         # Global Average Pooling → output_dim
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-        # Optional projection if conv_channels[-1] != output_dim
         if conv_channels[-1] != output_dim:
             self.proj = nn.Linear(conv_channels[-1], output_dim)
         else:
@@ -799,7 +812,6 @@ class BalancedDualBranchClassifier(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-        # ── Technique A: BERT Projection Layer ──
         pooled_dim = embedding_dim * 2  # [CLS] + MeanPool = 1536
         self.bert_projection = nn.Sequential(
             nn.Linear(pooled_dim, bert_proj_dim),
@@ -807,11 +819,9 @@ class BalancedDualBranchClassifier(nn.Module):
             nn.GELU(),
         )
 
-        # ── Technique C: Asymmetric Dropout ──
         self.bert_dropout = nn.Dropout(p=bert_dropout)    # Heavy: 0.5
         self.shape_dropout = nn.Dropout(p=shape_dropout)  # Light: 0.1
 
-        # Shape branch
         shape_in_channels = shape_cfg.get("in_channels", 5) if shape_cfg else 5
         shape_conv_channels = shape_cfg.get("conv_channels", [32, 64, 128]) if shape_cfg else [32, 64, 128]
         shape_output_dim = shape_cfg.get("output_dim", 128) if shape_cfg else 128
@@ -822,11 +832,10 @@ class BalancedDualBranchClassifier(nn.Module):
             output_dim=shape_output_dim,
         )
 
-        # ── Technique B: Fusion with LayerNorm AFTER concat ──
         fusion_dim = bert_proj_dim + shape_output_dim  # 256 + 128 = 384
 
         self.classifier = nn.Sequential(
-            nn.LayerNorm(fusion_dim),         # Technique B: equalize variance
+            nn.LayerNorm(fusion_dim),
             nn.Linear(fusion_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(p=fusion_dropout),
@@ -857,17 +866,14 @@ class BalancedDualBranchClassifier(nn.Module):
 
         bert_raw = torch.cat([cls_token, mean_pooled], dim=1)  # (batch, 1536)
 
-        # ★ Technique A: Project 1536 → 256
         bert_out = self.bert_projection(bert_raw)  # (batch, 256)
-        # ★ Technique C: Heavy dropout on BERT
         bert_out = self.bert_dropout(bert_out)      # (batch, 256)
 
         # ── Branch 2: ShapeCNN → Dropout ──
         shape_out = self.shape_cnn(shape_features)  # (batch, 128)
-        # ★ Technique C: Light dropout on Shape
         shape_out = self.shape_dropout(shape_out)    # (batch, 128)
 
-        # ── Fusion (★ Technique B: LayerNorm inside classifier) ──
+        # ── Fusion ──
         fused = torch.cat([bert_out, shape_out], dim=1)  # (batch, 384)
 
         return self.classifier(fused)
@@ -901,7 +907,6 @@ class DualBranchDataset(Dataset):
             return_tensors="pt",
         )
 
-        # Shape features (already normalized)
         shape = torch.tensor(self.shape_features[idx], dtype=torch.float32)  # [5, 101]
 
         return {
@@ -952,16 +957,11 @@ model = BalancedDualBranchClassifier(
     num_classes=cfg.NUM_CLASSES,
     fusion_dropout=cfg.DROPOUT_RATE,
 )
-model = model.to(DEVICE)
 
 # ── 4-Group Parameter Separation ──
-# Group 1: DNABERT-2 backbone (unfrozen layers only) — lowest LR
 backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-# Group 2: ShapeCNN branch — medium LR (train from scratch)
 shape_params = list(model.shape_cnn.parameters())
-# Group 3: BERT Projection layer — same LR as head (new parameters)
 proj_params = list(model.bert_projection.parameters())
-# Group 4: Fusion classifier head — controlled LR
 head_params = list(model.classifier.parameters())
 
 optimizer = optim.AdamW([
@@ -971,7 +971,6 @@ optimizer = optim.AdamW([
     {"params": head_params,     "lr": cfg.HEAD_LR,     "weight_decay": cfg.WEIGHT_DECAY},
 ])
 
-# Total training steps and warmup
 total_steps = (len(train_loader) // cfg.GRAD_ACCUM_STEPS) * cfg.EPOCHS
 warmup_steps = int(total_steps * cfg.WARMUP_RATIO)
 
@@ -994,7 +993,10 @@ class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 print(f"  [Auto-detect] Class weights for loss function: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(num_classes)]))
 
 criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.LABEL_SMOOTHING)
-scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+
+model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+    model, optimizer, train_loader, test_loader, scheduler
+)
 
 # Print model summary
 backbone_trainable = sum(p.numel() for p in backbone_params)
@@ -1015,71 +1017,56 @@ print(f"  Total trainable:                {total_trainable:>10,} params")
 print(f"  Total training steps:           {total_steps}")
 print(f"  Warmup steps:                   {warmup_steps}")
 print(f"  Label smoothing:                {cfg.LABEL_SMOOTHING}")
-print(f"\n  ★ KEY CHANGES vs Script 11:")
-print(f"    Projection:      1536→{cfg.BERT_PROJ_DIM} (was: no projection)")
-print(f"    Fusion dim:      {cfg.FUSION_DIM} (was: 1664)")
-print(f"    BERT dropout:    {cfg.BERT_DROPOUT} (was: 0)")
-print(f"    Shape dropout:   {cfg.SHAPE_DROPOUT} (was: 0)")
-print(f"    Head LR:         {cfg.HEAD_LR} (was: 1e-3)")
-print(f"    Weight decay:    {cfg.WEIGHT_DECAY} (was: 0.01)")
-print(f"    Epochs:          {cfg.EPOCHS} (was: 15)")
-print(f"    Patience:        {cfg.PATIENCE} (was: 5)")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 10: Training Loop with Gradient Accumulation & Early Stopping
 # ═══════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
-                    scaler, device, grad_accum_steps):
+def train_one_epoch(model, train_loader, optimizer, scheduler, criterion, device):
     """Train for one epoch with gradient accumulation (dual-input)."""
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    optimizer.zero_grad()
+    train_loss_sum, train_total = 0.0, 0
+    all_train_preds, all_train_targets = [], []
 
-    pbar = tqdm(train_loader, desc="  Training", leave=False)
-    for step, batch in enumerate(pbar):
+    for step, batch in enumerate(train_loader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         shape_features = batch["shape_features"].to(device)
         labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
-            logits = model(input_ids, attention_mask, shape_features)
-            loss = criterion(logits, labels)
-            loss = loss / grad_accum_steps  # Scale loss for accumulation
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                logits = model(input_ids, attention_mask, shape_features)
+                loss = criterion(logits, labels)
 
-        scaler.scale(loss).backward()
-
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        running_loss += loss.item() * grad_accum_steps * labels.size(0)
+        # Gather metrics
         _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
+        loss_gathered = accelerator.gather(loss).mean().item()
 
-        pbar.set_postfix({
-            "loss": f"{running_loss/total:.4f}",
-            "acc": f"{correct/total:.4f}",
-        })
+        train_loss_sum += loss_gathered * targets_gathered.size(0)
+        train_total += targets_gathered.size(0)
+        all_train_preds.extend(preds_gathered.cpu().numpy())
+        all_train_targets.extend(targets_gathered.cpu().numpy())
 
-    return running_loss / total, correct / total
+    train_loss = train_loss_sum / train_total
+    train_acc = accuracy_score(all_train_targets, all_train_preds)
+    return train_loss, train_acc
 
 
 @torch.no_grad()
 def evaluate(model, test_loader, criterion, device):
     """Evaluate on validation/test set (dual-input)."""
     model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    val_loss_sum, val_total = 0.0, 0
+    all_val_preds, all_val_targets = [], []
 
     for batch in test_loader:
         input_ids = batch["input_ids"].to(device)
@@ -1087,20 +1074,27 @@ def evaluate(model, test_loader, criterion, device):
         shape_features = batch["shape_features"].to(device)
         labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
             loss = criterion(logits, labels)
 
-        running_loss += loss.item() * labels.size(0)
+        # Gather metrics
         _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
+        loss_gathered = accelerator.gather(loss).mean().item()
 
-    return running_loss / total, correct / total
+        val_loss_sum += loss_gathered * targets_gathered.size(0)
+        val_total += targets_gathered.size(0)
+        all_val_preds.extend(preds_gathered.cpu().numpy())
+        all_val_targets.extend(targets_gathered.cpu().numpy())
+
+    val_loss = val_loss_sum / val_total
+    val_acc = accuracy_score(all_val_targets, all_val_preds)
+    return val_loss, val_acc
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, scaler, cfg, device):
+                criterion, cfg, device):
     """Full training loop with early stopping."""
     print("\n" + "=" * 60)
     print("TRAINING — Balanced Dual-Branch (DNABERT-2 + DNAshape CNN)")
@@ -1115,8 +1109,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion,
-            scaler, device, cfg.GRAD_ACCUM_STEPS,
+            model, train_loader, optimizer, scheduler, criterion, device
         )
 
         val_loss, val_acc = evaluate(model, test_loader, criterion, device)
@@ -1129,44 +1122,46 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["val_acc"].append(val_acc)
 
         backbone_lr = optimizer.param_groups[0]["lr"]
-        shape_lr = optimizer.param_groups[1]["lr"]
-        head_lr = optimizer.param_groups[3]["lr"]
+        gap_percent = (train_acc - val_acc) * 100
 
         print(
-            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} │ "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} │ "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f} │ "
-            f"LR: {backbone_lr:.1e}/{shape_lr:.1e}/{head_lr:.1e} │ {elapsed:.1f}s"
+            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
+            f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+            f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+            f"Gap: {gap_percent:+.2f}% | "
+            f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
         )
 
         # Checkpoint based on val_acc (accuracy-based early stopping)
+        accelerator.wait_for_everyone()
         if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
             ckpt_path = os.path.join(cfg.MODEL_DIR, "best_balanced_dual.pt")
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-            }, ckpt_path)
-            print(f"  → Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
+            if accelerator.is_main_process:
+                unwrapped = accelerator.unwrap_model(model)
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": unwrapped.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }, ckpt_path)
+                print(f"  → Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
                 print(f"\n  ⏹ Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
+        accelerator.wait_for_everyone()
 
-    print(f"\nTraining complete.")
-    print(f"  Best val_loss: {best_val_loss:.4f}")
-    print(f"  Best val_acc:  {best_val_acc:.4f}")
+    print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
 history = train_model(
     model, train_loader, test_loader, optimizer, scheduler,
-    criterion, scaler, cfg, DEVICE,
+    criterion, cfg, DEVICE,
 )
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1175,8 +1170,9 @@ history = train_model(
 
 best_path = os.path.join(cfg.MODEL_DIR, "best_balanced_dual.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
-model.load_state_dict(checkpoint["model_state_dict"])
-model = model.to(DEVICE)
+unwrapped = accelerator.unwrap_model(model)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
+model = unwrapped
 model.eval()
 print(f"Loaded best model from epoch {checkpoint['epoch']} "
       f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
@@ -1191,16 +1187,20 @@ def full_evaluation(model, test_loader, class_names, device):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"]
+        labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
         probs = torch.softmax(logits.float(), dim=1)
         _, preds = logits.max(1)
 
-        all_preds.extend(preds.cpu().numpy())
-        all_targets.extend(labels.numpy())
-        all_probs.extend(probs.cpu().numpy())
+        # Gather metrics across GPUs
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((preds, labels))
+        probs_gathered = accelerator.gather_for_metrics(probs)
+
+        all_preds.extend(preds_gathered.cpu().numpy())
+        all_targets.extend(targets_gathered.cpu().numpy())
+        all_probs.extend(probs_gathered.cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
@@ -1212,13 +1212,14 @@ def full_evaluation(model, test_loader, class_names, device):
     report_str = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
     print(report_str)
 
-    # ★ Save classification report to file
-    report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
-    with open(report_path, "w") as f:
-        f.write("CLASSIFICATION REPORT — Balanced Dual-Branch\n")
-        f.write("=" * 60 + "\n")
-        f.write(report_str)
-    print(f"  → Classification report saved to: {report_path}")
+    # Save classification report to file
+    if accelerator.is_main_process:
+        report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
+        with open(report_path, "w") as f:
+            f.write("CLASSIFICATION REPORT — Balanced Dual-Branch\n")
+            f.write("=" * 60 + "\n")
+            f.write(report_str)
+        print(f"  → Classification report saved to: {report_path}")
 
     acc = accuracy_score(all_targets, all_preds)
     f1_macro = f1_score(all_targets, all_preds, average="macro")
@@ -1249,7 +1250,6 @@ def export_igv_bed_files(headers_test, predictions, targets, output_dir):
     true_sp4_coords = []
     confused_sp4_as_sp1_coords = []
     
-    # Class indexing: SP1=0, SP2=1, SP4=2, Negative=3
     for idx, (pred, target) in enumerate(zip(predictions, targets)):
         header = headers_test[idx]
         bed_fields = parse_header_to_bed(header)
@@ -1266,7 +1266,6 @@ def export_igv_bed_files(headers_test, predictions, targets, output_dir):
         elif target == 2 and pred == 0:  # SP4 misclassified as SP1
             confused_sp4_as_sp1_coords.append(bed_line)
             
-    # Write BED files
     with open(os.path.join(output_dir, "True_SP1.bed"), "w") as f:
         f.writelines(true_sp1_coords)
     with open(os.path.join(output_dir, "True_SP4.bed"), "w") as f:
@@ -1279,7 +1278,8 @@ def export_igv_bed_files(headers_test, predictions, targets, output_dir):
     print(f"    - True_SP4.bed: {len(true_sp4_coords)} lines")
     print(f"    - Confused_SP4_as_SP1.bed: {len(confused_sp4_as_sp1_coords)} lines")
 
-export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
+if accelerator.is_main_process:
+    export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 12: Generate All Performance Figures

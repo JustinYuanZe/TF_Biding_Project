@@ -77,6 +77,15 @@ install_packages()
 # ═══════════════════════════════════════════════════════════════════════
 
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 import gc
 import math
 import time
@@ -91,7 +100,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
@@ -121,10 +129,8 @@ if torch.cuda.is_available():
 
 def auto_detect_dir(target_file, fallback="data/processed"):
     """Search for the directory containing target_file in Kaggle input or local path."""
-    # First check fallback
     if os.path.exists(fallback) and os.path.exists(os.path.join(fallback, target_file)):
         return fallback
-    # Then search in /kaggle/input (recursive)
     if os.path.exists("/kaggle/input"):
         for root, _, files in os.walk("/kaggle/input"):
             if target_file in files:
@@ -136,8 +142,6 @@ class Config:
     """Central configuration for the fine-tuning pipeline."""
 
     # ── Paths ──
-    # Kaggle: /kaggle/input/<dataset-name>/
-    # Local:  data/processed/
     DATA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
     OUTPUT_DIR = "outputs_finetune"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
@@ -187,7 +191,21 @@ torch.manual_seed(cfg.RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.RANDOM_SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
+    kwargs_handlers=[ddp_kwargs],
+)
+DEVICE = accelerator.device
+
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
 print(f"\nUsing device: {DEVICE}")
 print(f"Fine-tuning strategy: Unfreeze last {cfg.UNFREEZE_LAST_N_LAYERS} layers")
 print(f"Effective batch size: {cfg.BATCH_SIZE} × {cfg.GRAD_ACCUM_STEPS} = {cfg.BATCH_SIZE * cfg.GRAD_ACCUM_STEPS}")
@@ -486,11 +504,9 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
     patch_flash_attention()
 
     # ── Selective Freezing / Unfreezing ──
-    # First, freeze everything
     for param in model.parameters():
         param.requires_grad = False
 
-    # Then, unfreeze the last N encoder layers
     total_layers = len(model.encoder.layer)
     unfreeze_from = total_layers - unfreeze_last_n
 
@@ -506,7 +522,6 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
             for param in layer.parameters():
                 frozen_count += param.numel()
 
-    # Also count embedding params as frozen
     for param in model.embeddings.parameters():
         frozen_count += param.numel()
 
@@ -634,7 +649,6 @@ model = DNABERT2Classifier(
     num_classes=cfg.NUM_CLASSES,
     dropout_rate=cfg.DROPOUT_RATE,
 )
-model = model.to(DEVICE)
 
 # Separate parameter groups for differential learning rates
 backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -668,7 +682,10 @@ class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 print(f"  [Auto-detect] Class weights for loss function: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(num_classes)]))
 
 criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.LABEL_SMOOTHING)
-scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+
+model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+    model, optimizer, train_loader, test_loader, scheduler
+)
 
 # Print model summary
 backbone_trainable = sum(p.numel() for p in backbone_params)
@@ -689,77 +706,77 @@ print(f"  Label smoothing:           {cfg.LABEL_SMOOTHING}")
 # CELL 9: Training Loop with Gradient Accumulation & Early Stopping
 # ═══════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
-                    scaler, device, grad_accum_steps):
+def train_one_epoch(model, train_loader, optimizer, scheduler, criterion, device):
     """Train for one epoch with gradient accumulation."""
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    optimizer.zero_grad()
+    train_loss_sum, train_total = 0.0, 0
+    all_train_preds, all_train_targets = [], []
 
-    pbar = tqdm(train_loader, desc="  Training", leave=False)
-    for step, batch in enumerate(pbar):
+    for step, batch in enumerate(train_loader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
-            logits = model(input_ids, attention_mask)
-            loss = criterion(logits, labels)
-            loss = loss / grad_accum_steps  # Scale loss for accumulation
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                logits = model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
 
-        scaler.scale(loss).backward()
-
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
-            # Gradient clipping to prevent exploding gradients during fine-tuning
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        running_loss += loss.item() * grad_accum_steps * labels.size(0)
+        # Gather metrics
         _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
+        loss_gathered = accelerator.gather(loss).mean().item()
 
-        pbar.set_postfix({
-            "loss": f"{running_loss/total:.4f}",
-            "acc": f"{correct/total:.4f}",
-        })
+        train_loss_sum += loss_gathered * targets_gathered.size(0)
+        train_total += targets_gathered.size(0)
+        all_train_preds.extend(preds_gathered.cpu().numpy())
+        all_train_targets.extend(targets_gathered.cpu().numpy())
 
-    return running_loss / total, correct / total
+    train_loss = train_loss_sum / train_total
+    train_acc = accuracy_score(all_train_targets, all_train_preds)
+    return train_loss, train_acc
 
 
 @torch.no_grad()
 def evaluate(model, test_loader, criterion, device):
     """Evaluate on validation/test set."""
     model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    val_loss_sum, val_total = 0.0, 0
+    all_val_preds, all_val_targets = [], []
 
     for batch in test_loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask)
             loss = criterion(logits, labels)
 
-        running_loss += loss.item() * labels.size(0)
+        # Gather metrics
         _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
+        loss_gathered = accelerator.gather(loss).mean().item()
 
-    return running_loss / total, correct / total
+        val_loss_sum += loss_gathered * targets_gathered.size(0)
+        val_total += targets_gathered.size(0)
+        all_val_preds.extend(preds_gathered.cpu().numpy())
+        all_val_targets.extend(targets_gathered.cpu().numpy())
+
+    val_loss = val_loss_sum / val_total
+    val_acc = accuracy_score(all_val_targets, all_val_preds)
+    return val_loss, val_acc
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, scaler, cfg, device):
+                criterion, cfg, device):
     """Full training loop with early stopping."""
     print("\n" + "=" * 60)
     print("TRAINING — End-to-End Fine-Tuning")
@@ -774,8 +791,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion,
-            scaler, device, cfg.GRAD_ACCUM_STEPS,
+            model, train_loader, optimizer, scheduler, criterion, device
         )
 
         val_loss, val_acc = evaluate(model, test_loader, criterion, device)
@@ -788,43 +804,46 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["val_acc"].append(val_acc)
 
         backbone_lr = optimizer.param_groups[0]["lr"]
-        head_lr = optimizer.param_groups[1]["lr"]
+        gap_percent = (train_acc - val_acc) * 100
 
         print(
-            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} │ "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} │ "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f} │ "
-            f"LR: {backbone_lr:.1e}/{head_lr:.1e} │ {elapsed:.1f}s"
+            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
+            f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+            f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+            f"Gap: {gap_percent:+.2f}% | "
+            f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
         )
 
-        # Checkpoint based on val_loss
-        if val_loss < best_val_loss:
+        # Checkpoint based on val_acc (using the requested val_acc-based early stopping logic)
+        accelerator.wait_for_everyone()
+        if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
             ckpt_path = os.path.join(cfg.MODEL_DIR, "best_dnabert2_finetune.pt")
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-            }, ckpt_path)
-            print(f"  → Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
+            if accelerator.is_main_process:
+                unwrapped = accelerator.unwrap_model(model)
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": unwrapped.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }, ckpt_path)
+                print(f"  → Saved best model (val_acc={val_acc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
                 print(f"\n  ⏹ Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
+        accelerator.wait_for_everyone()
 
-    print(f"\nTraining complete.")
-    print(f"  Best val_loss: {best_val_loss:.4f}")
-    print(f"  Best val_acc:  {best_val_acc:.4f}")
+    print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
 history = train_model(
     model, train_loader, test_loader, optimizer, scheduler,
-    criterion, scaler, cfg, DEVICE,
+    criterion, cfg, DEVICE,
 )
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -833,8 +852,9 @@ history = train_model(
 
 best_path = os.path.join(cfg.MODEL_DIR, "best_dnabert2_finetune.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
-model.load_state_dict(checkpoint["model_state_dict"])
-model = model.to(DEVICE)
+unwrapped = accelerator.unwrap_model(model)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
+model = unwrapped
 model.eval()
 print(f"Loaded best model from epoch {checkpoint['epoch']} "
       f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
@@ -848,16 +868,20 @@ def full_evaluation(model, test_loader, class_names, device):
     for batch in tqdm(test_loader, desc="  Evaluating"):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"]
+        labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask)
         probs = torch.softmax(logits.float(), dim=1)
         _, preds = logits.max(1)
 
-        all_preds.extend(preds.cpu().numpy())
-        all_targets.extend(labels.numpy())
-        all_probs.extend(probs.cpu().numpy())
+        # Gather metrics across GPUs
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((preds, labels))
+        probs_gathered = accelerator.gather_for_metrics(probs)
+
+        all_preds.extend(preds_gathered.cpu().numpy())
+        all_targets.extend(targets_gathered.cpu().numpy())
+        all_probs.extend(probs_gathered.cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)

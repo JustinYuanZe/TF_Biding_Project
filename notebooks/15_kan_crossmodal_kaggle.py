@@ -3,49 +3,6 @@
 Script 15: KAN-Regularized Cross-Modal Attention Dual-Branch
 Designed for: Kaggle GPU (T4/P100) or Google Colab
 Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
-
-BOTTLENECK FIXES vs Script 14 (Val Acc 61.33%, Train Acc 92% → 34% gap):
-
-  BOTTLENECK 1 — Overfitting (Train 92% vs Val 58%):
-    Fix A. Freeze more BERT layers: 6→3 unfrozen (halve backbone trainable params)
-    Fix B. Aggressive dropout: fusion 0.3→0.5, cross-attn 0.1→0.15
-    Fix C. R-Drop regularization (KL-divergence on dual forward passes)
-    Fix D. Higher weight decay: 0.1→0.15
-    Fix E. Tighter gradient clipping: max_norm 1.0→0.5
-    Fix F. Lower backbone LR: 1e-5→5e-6
-
-  BOTTLENECK 2 — MLP classifier too rigid (181 SP4→SP1 misclassifications):
-    Fix G. ChebyKAN classifier (Chebyshev polynomial KAN replaces nn.Linear)
-           B-spline-like curved decision boundaries instead of hyperplanes
-
-  BOTTLENECK 3 (additional) — Shallow cross-modal communication:
-    Fix H. 2 cross-attention layers (was 1) with DropPath stochastic depth
-    Fix I. Learnable positional embedding for shape spatial positions
-    Fix J. Attention Pooling (learnable query token) for sequence aggregation
-
-  BOTTLENECK 4 (additional) — Loss function treats all errors equally:
-    Fix K. Focal Loss (gamma=2): down-weight easy Negative class,
-           focus gradient on hard SP1/SP4 confusion cases
-
-ARCHITECTURE (Script 15):
-  Branch 1 — DNABERT-2 (3 layers unfrozen):
-    Full tokens [B, T, 768] → Linear(768→128) → [B, T, 128]
-
-  Branch 2 — SpatialShapeCNN + Positional Embedding:
-    [B, 5, 101] → Conv1D×3 → [B, 25, 128] + pos_embed
-
-  Cross-Modal Attention (2 layers, DropPath):
-    Layer 1: seq ↔ shape bidirectional (4 heads, d=128)
-    Layer 2: seq ↔ shape bidirectional (4 heads, d=128)
-
-  Pooling:
-    Seq: AttentionPooling (learnable [QUERY] token)
-    Shape: Mean pooling
-
-  KAN Classifier:
-    LayerNorm(256) → ChebyKAN(256→64) → LayerNorm → Dropout(0.5) → ChebyKAN(64→4)
-
-  Loss: Focal Loss + R-Drop KL-divergence
 """
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -54,6 +11,11 @@ ARCHITECTURE (Script 15):
 
 import subprocess
 import sys
+import os
+
+# Suppress Hugging Face warnings and tokenizers parallelism messages
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def install_packages():
     packages = [
@@ -63,13 +25,15 @@ def install_packages():
         "accelerate>=0.25.0",
         "safetensors>=0.4.0",
     ]
-    for pkg in packages:
-        try:
-            pkg_name = pkg.split(">=")[0].split("==")[0]
-            __import__(pkg_name)
-        except ImportError:
-            print(f"Installing {pkg}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+    # Only run pip install on local rank 0 to avoid race conditions
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        for pkg in packages:
+            try:
+                pkg_name = pkg.split(">=")[0].split("==")[0]
+                __import__(pkg_name)
+            except ImportError:
+                print(f"Installing {pkg}...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 install_packages()
 
@@ -77,13 +41,18 @@ install_packages()
 # CELL 1: Imports
 # ═══════════════════════════════════════════════════════════════════════
 
-import os
 import gc
 import math
 import time
 import random
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -92,7 +61,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
@@ -114,9 +82,6 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB"
-          if hasattr(torch.cuda.get_device_properties(0), 'total_mem')
-          else f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     torch.backends.cudnn.benchmark = True
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -166,16 +131,16 @@ class Config:
     EMBEDDING_DIM = 768
     MAX_TOKEN_LENGTH = 512
 
-    # ── Fine-Tuning (FIX A: freeze more layers) ──
-    UNFREEZE_LAST_N_LAYERS = 3     # was 6 → halves backbone trainable params
-    BACKBONE_LR = 5e-6             # was 1e-5 → more conservative (FIX F)
+    # ── Fine-Tuning ──
+    UNFREEZE_LAST_N_LAYERS = 3     # freeze more layers
+    BACKBONE_LR = 5e-6             # conservative backbone LR
 
-    # ── Cross-Modal Attention (FIX H: deeper) ──
+    # ── Cross-Modal Attention ──
     CROSS_ATTN_D_MODEL = 128
     CROSS_ATTN_NHEAD = 4
-    CROSS_ATTN_LAYERS = 2          # was 1 → deeper cross-modal communication
-    CROSS_ATTN_DROPOUT = 0.15      # was 0.1 → more regularization (FIX B)
-    DROP_PATH_RATE = 0.1           # NEW: stochastic depth
+    CROSS_ATTN_LAYERS = 2
+    CROSS_ATTN_DROPOUT = 0.15
+    DROP_PATH_RATE = 0.1
     CROSS_ATTN_LR = 1.5e-4
     SEQ_PROJ_LR = 1.5e-4
 
@@ -185,29 +150,29 @@ class Config:
     SHAPE_CONV_CHANNELS = [32, 64, 128]
     SHAPE_LR = 2e-4
 
-    # ── KAN Classifier (FIX G: replaces MLP) ──
-    KAN_HIDDEN_DIM = 64            # smaller than MLP's 256 → fewer params
-    KAN_DEGREE = 4                 # Chebyshev polynomial degree
-    FUSION_DROPOUT = 0.5           # was 0.3 → aggressive regularization (FIX B)
-    HEAD_LR = 1e-4                 # KAN needs slightly higher LR
-    ATTN_POOL_LR = 1.5e-4         # for attention pooling module
+    # ── KAN Classifier ──
+    KAN_HIDDEN_DIM = 64
+    KAN_DEGREE = 4
+    FUSION_DROPOUT = 0.5
+    HEAD_LR = 1e-4
+    ATTN_POOL_LR = 1.5e-4
 
-    # ── Loss Function (FIX K) ──
-    FOCAL_GAMMA = 2.0              # down-weight easy examples
+    # ── Loss Function ──
+    FOCAL_GAMMA = 2.0
     LABEL_SMOOTHING = 0.1
     NUM_CLASSES = 4
-    WEIGHT_DECAY = 0.15            # was 0.1 → stronger L2 (FIX D)
+    WEIGHT_DECAY = 0.15
 
-    # ── R-Drop Regularization (FIX C) ──
-    RDROP_ALPHA = 1.0              # KL divergence weight
+    # ── R-Drop Regularization ──
+    RDROP_ALPHA = 1.0
 
     # ── Training ──
-    BATCH_SIZE = 12                # reduced from 16 for R-Drop VRAM
-    GRAD_ACCUM_STEPS = 6           # effective batch = 72 (was 64)
-    EPOCHS = 30                    # more epochs since regularization slows learning
+    BATCH_SIZE = 12
+    GRAD_ACCUM_STEPS = 6
+    EPOCHS = 30
     PATIENCE = 12
     WARMUP_RATIO = 0.1
-    MAX_GRAD_NORM = 0.5            # was 1.0 → tighter clipping (FIX E)
+    MAX_GRAD_NORM = 0.5
 
     # ── Data Split ──
     TEST_SIZE = 0.2
@@ -235,7 +200,22 @@ torch.manual_seed(cfg.RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.RANDOM_SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Initialize Accelerator
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
+    kwargs_handlers=[ddp_kwargs],
+)
+DEVICE = accelerator.device
+
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
 print(f"\nUsing device: {DEVICE}")
 print(f"Architecture: KAN-Regularized Cross-Modal Attention Dual-Branch")
 print(f"  * Cross-Attention: {cfg.CROSS_ATTN_LAYERS} layers, {cfg.CROSS_ATTN_NHEAD} heads, d={cfg.CROSS_ATTN_D_MODEL}")
@@ -480,7 +460,7 @@ def patch_flash_attention():
     print(f"  Patched {patched} flash-attention refs." if patched else "  No flash-attn refs to patch.")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 6: Load DNABERT-2 Backbone (FIX A: only 3 layers unfrozen)
+# CELL 6: Load DNABERT-2 Backbone (Selective Fine-Tuning)
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_dnabert2(model_name, device, unfreeze_last_n=3):
@@ -576,7 +556,6 @@ dnabert_model, tokenizer = load_dnabert2(cfg.DNABERT_MODEL, DEVICE, cfg.UNFREEZE
 # CELL 7: KAN + Cross-Modal Architecture (ALL BOTTLENECK FIXES)
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── FIX H supplement: Stochastic Depth ──
 class DropPath(nn.Module):
     """Stochastic depth: randomly drops entire residual branches during training."""
     def __init__(self, drop_prob=0.0):
@@ -592,72 +571,36 @@ class DropPath(nn.Module):
         return x.div(keep) * mask
 
 
-# ── FIX G: Chebyshev KAN Layer ──
 class ChebyKANLinear(nn.Module):
-    """
-    Kolmogorov-Arnold Network layer using Chebyshev polynomial basis.
-
-    Instead of y = Wx + b (hyperplane), KAN learns:
-      y = W_base * x + sum_d(coeff_d * T_d(tanh(x)))
-    where T_d are Chebyshev polynomials of degree d.
-
-    This provides CURVED decision boundaries that can slice through
-    the entangled SP1/SP4 manifold, where linear MLP cannot.
-    """
+    """Kolmogorov-Arnold Network layer using Chebyshev polynomial basis."""
     def __init__(self, in_features, out_features, degree=4):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.degree = degree
 
-        # Chebyshev coefficients: learnable non-linear edge activations
         self.cheby_coeffs = nn.Parameter(
             torch.randn(out_features, in_features, degree + 1)
             * (1.0 / math.sqrt(in_features * (degree + 1)))
         )
-
-        # Residual linear path (like skip connection for stability)
         self.base_linear = nn.Linear(in_features, out_features)
 
     def forward(self, x):
-        """
-        Args:
-            x: [batch, in_features]
-        Returns:
-            [batch, out_features]
-        """
-        # Residual linear: standard affine transform
         base_output = self.base_linear(x)
-
-        # Normalize to [-1, 1] for Chebyshev domain
         x_norm = torch.tanh(x)
-
-        # Compute Chebyshev polynomials via stable 3-term recurrence:
-        #   T_0(x) = 1, T_1(x) = x, T_{n+1}(x) = 2x*T_n(x) - T_{n-1}(x)
         T = [torch.ones_like(x_norm)]
         if self.degree >= 1:
             T.append(x_norm)
         for n in range(2, self.degree + 1):
             T.append(2.0 * x_norm * T[-1] - T[-2])
 
-        # Stack basis: [batch, in_features, degree+1]
         cheby_basis = torch.stack(T, dim=-1)
-
-        # Weighted sum over all edges: output[b,o] = sum_{i,d} basis[b,i,d] * coeffs[o,i,d]
         kan_output = torch.einsum('bid,oid->bo', cheby_basis, self.cheby_coeffs)
-
         return base_output + kan_output
 
 
-# ── FIX I: SpatialShapeCNN with positional embedding ──
 class SpatialShapeCNN(nn.Module):
-    """
-    Conv1D on DNAshape features, preserving spatial dimension.
-    Now includes learnable positional embedding (FIX I).
-
-    Input:  [B, 5, 101]
-    Output: [B, 25, d_model] + positional embedding
-    """
+    """Conv1D on DNAshape features, preserving spatial dimension."""
     def __init__(self, in_channels=5, conv_channels=None, d_model=128, max_positions=26):
         super().__init__()
         if conv_channels is None:
@@ -686,17 +629,16 @@ class SpatialShapeCNN(nn.Module):
         else:
             self.proj = nn.Identity()
 
-        # FIX I: Learnable positional embedding for spatial positions
         self.pos_embed = nn.Parameter(torch.randn(1, max_positions, d_model) * 0.02)
 
     def forward(self, x):
-        x = self.conv_block1(x)   # [B, 32, 50]
-        x = self.conv_block2(x)   # [B, 64, 25]
-        x = self.conv_block3(x)   # [B, 128, 25]
-        x = x.transpose(1, 2)    # [B, 25, 128]
-        x = self.proj(x)         # [B, 25, d_model]
+        x = self.conv_block1(x)
+        x = self.conv_block2(x)
+        x = self.conv_block3(x)
+        x = x.transpose(1, 2)
+        x = self.proj(x)
         L = x.size(1)
-        x = x + self.pos_embed[:, :L, :]  # Add positional info
+        x = x + self.pos_embed[:, :L, :]
         return x
 
 
@@ -718,15 +660,10 @@ class FeedForward(nn.Module):
         return x + self.drop_path(self.net(x))
 
 
-# ── FIX H: Cross-Modal Attention with DropPath ──
 class CrossModalAttentionLayer(nn.Module):
-    """
-    Bidirectional Cross-Modal Attention with DropPath (stochastic depth).
-    Same structure as Script 14 but with DropPath on residual connections.
-    """
+    """Bidirectional Cross-Modal Attention with DropPath."""
     def __init__(self, d_model=128, nhead=4, dropout=0.1, drop_path=0.0):
         super().__init__()
-        # 1D → 3D
         self.cross_attn_seq2shape = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True
         )
@@ -734,7 +671,6 @@ class CrossModalAttentionLayer(nn.Module):
         self.drop_path_seq = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.ffn_seq = FeedForward(d_model, expansion=4, dropout=dropout, drop_path=drop_path)
 
-        # 3D → 1D
         self.cross_attn_shape2seq = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True
         )
@@ -743,14 +679,12 @@ class CrossModalAttentionLayer(nn.Module):
         self.ffn_shape = FeedForward(d_model, expansion=4, dropout=dropout, drop_path=drop_path)
 
     def forward(self, seq_features, shape_features, seq_key_padding_mask=None):
-        # 1D → 3D: sequence queries structure
         attended_seq, _ = self.cross_attn_seq2shape(
             query=seq_features, key=shape_features, value=shape_features
         )
         seq_out = self.norm_seq(seq_features + self.drop_path_seq(attended_seq))
         seq_out = self.ffn_seq(seq_out)
 
-        # 3D → 1D: structure queries sequence
         attended_shape, _ = self.cross_attn_shape2seq(
             query=shape_features, key=seq_features, value=seq_features,
             key_padding_mask=seq_key_padding_mask
@@ -761,12 +695,8 @@ class CrossModalAttentionLayer(nn.Module):
         return seq_out, shape_out
 
 
-# ── FIX J: Attention Pooling ──
 class AttentionPooling(nn.Module):
-    """
-    Learnable query token that attends over sequence to produce a single vector.
-    Better than mean pooling: learns to focus on the most informative positions.
-    """
+    """Learnable query token that attends over sequence to produce a single vector."""
     def __init__(self, d_model, nhead=4, dropout=0.1):
         super().__init__()
         self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
@@ -776,35 +706,14 @@ class AttentionPooling(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x, key_padding_mask=None):
-        """
-        Args:
-            x: [B, L, d_model]
-            key_padding_mask: [B, L] bool, True for padding
-        Returns:
-            [B, d_model]
-        """
         B = x.size(0)
-        q = self.query.expand(B, -1, -1)  # [B, 1, d_model]
+        q = self.query.expand(B, -1, -1)
         out, _ = self.attn(q, x, x, key_padding_mask=key_padding_mask)
-        return self.norm(out.squeeze(1))  # [B, d_model]
+        return self.norm(out.squeeze(1))
 
 
-# ── Full Model: CrossModalKANClassifier ──
 class CrossModalKANClassifier(nn.Module):
-    """
-    Script 15: KAN-Regularized Cross-Modal Attention Dual-Branch.
-
-    Fixes all 4 identified bottlenecks:
-      1. Overfitting → aggressive regularization (DropPath, R-Drop, fewer unfrozen layers)
-      2. MLP rigidity → ChebyKAN curved decision boundaries
-      3. Shallow attention → 2-layer cross-attention
-      4. Equal error treatment → Focal Loss (external)
-
-    Additional improvements:
-      - Positional embedding for shape spatial positions
-      - Attention pooling for sequence aggregation
-      - DropPath stochastic depth in cross-attention
-    """
+    """Full Model: CrossModalKANClassifier."""
     def __init__(self, backbone, embedding_dim=768,
                  shape_in_channels=5, shape_conv_channels=None,
                  d_model=128, nhead=4, num_cross_layers=2, cross_dropout=0.15,
@@ -815,7 +724,6 @@ class CrossModalKANClassifier(nn.Module):
         self.backbone = backbone
         self.d_model = d_model
 
-        # ── Branch 1: DNABERT-2 token projection ──
         self.seq_projection = nn.Sequential(
             nn.Linear(embedding_dim, d_model),
             nn.LayerNorm(d_model),
@@ -823,7 +731,6 @@ class CrossModalKANClassifier(nn.Module):
             nn.Dropout(0.1),
         )
 
-        # ── Branch 2: SpatialShapeCNN with positional embedding ──
         if shape_conv_channels is None:
             shape_conv_channels = [32, 64, 128]
         self.shape_cnn = SpatialShapeCNN(
@@ -832,7 +739,6 @@ class CrossModalKANClassifier(nn.Module):
             d_model=d_model,
         )
 
-        # ── Cross-Modal Attention (2 layers with increasing DropPath) ──
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_cross_layers)]
         self.cross_attention_layers = nn.ModuleList([
             CrossModalAttentionLayer(
@@ -842,11 +748,9 @@ class CrossModalKANClassifier(nn.Module):
             for i in range(num_cross_layers)
         ])
 
-        # ── Attention Pooling for sequence (FIX J) ──
         self.seq_attn_pool = AttentionPooling(d_model, nhead=nhead, dropout=cross_dropout)
 
-        # ── KAN Classifier (FIX G: replaces MLP) ──
-        fusion_dim = d_model * 2  # 128 + 128 = 256
+        fusion_dim = d_model * 2
         self.classifier = nn.Sequential(
             nn.LayerNorm(fusion_dim),
             ChebyKANLinear(fusion_dim, kan_hidden_dim, degree=kan_degree),
@@ -856,15 +760,12 @@ class CrossModalKANClassifier(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask, shape_features):
-        # ── Branch 1: DNABERT-2 full token outputs ──
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs[0]  # [B, T, 768]
-        seq_features = self.seq_projection(hidden_states)  # [B, T, d_model]
+        hidden_states = outputs[0]
+        seq_features = self.seq_projection(hidden_states)
 
-        # ── Branch 2: SpatialShapeCNN + positional embedding ──
-        shape_feats = self.shape_cnn(shape_features)  # [B, 25, d_model]
+        shape_feats = self.shape_cnn(shape_features)
 
-        # ── Cross-Modal Attention (2 layers) ──
         seq_key_padding_mask = (attention_mask == 0)
         for cross_layer in self.cross_attention_layers:
             seq_features, shape_feats = cross_layer(
@@ -872,17 +773,11 @@ class CrossModalKANClassifier(nn.Module):
                 seq_key_padding_mask=seq_key_padding_mask
             )
 
-        # ── Pooling (AFTER cross-attention) ──
-        # Seq: Attention Pooling (learnable query, handles padding)
         seq_pooled = self.seq_attn_pool(seq_features, key_padding_mask=seq_key_padding_mask)
-
-        # Shape: Mean pooling (dense, short sequence)
         shape_pooled = shape_feats.mean(dim=1)
 
-        # ── Fusion + KAN Classification ──
-        fused = torch.cat([seq_pooled, shape_pooled], dim=1)  # [B, 2*d_model]
+        fused = torch.cat([seq_pooled, shape_pooled], dim=1)
         return self.classifier(fused)
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 8: DualBranchDataset & DataLoaders
@@ -923,7 +818,7 @@ print(f"DataLoaders: {len(train_loader)} train, {len(test_loader)} test batches"
 print(f"Grad accum: {cfg.GRAD_ACCUM_STEPS} -> effective batch = {cfg.BATCH_SIZE * cfg.GRAD_ACCUM_STEPS}")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 9: Build Model & Optimizer (6-Group Differential LR)
+# CELL 9: Build Model & Optimizer
 # ═══════════════════════════════════════════════════════════════════════
 
 model = CrossModalKANClassifier(
@@ -941,7 +836,6 @@ model = CrossModalKANClassifier(
     num_classes=cfg.NUM_CLASSES,
     fusion_dropout=cfg.FUSION_DROPOUT,
 )
-model = model.to(DEVICE)
 
 # ── 6-Group Parameter Separation ──
 backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -971,18 +865,19 @@ def lr_lambda(current_step):
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+# Prepare components
+model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+    model, optimizer, train_loader, test_loader, scheduler
+)
+
 # Class weights
 class_counts = np.bincount(y_train)
 class_weights = len(y_train) / (len(class_counts) * class_counts.astype(np.float32))
 class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(len(class_counts))]))
 
-# ── FIX K: Focal Loss ──
+# ── Focal Loss ──
 class FocalLoss(nn.Module):
-    """
-    Focal Loss: FL(p_t) = -alpha_t * (1-p_t)^gamma * log(p_t)
-    gamma > 0 down-weights easy examples, focusing on hard SP1/SP4 confusion.
-    """
     def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0, reduction='mean'):
         super().__init__()
         self.alpha = alpha
@@ -1005,7 +900,6 @@ criterion = FocalLoss(
     gamma=cfg.FOCAL_GAMMA,
     label_smoothing=cfg.LABEL_SMOOTHING,
 )
-scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
 
 # Print model summary
 groups = {
@@ -1027,25 +921,12 @@ for name, (params, lr) in groups.items():
 print(f"  {'─'*50}")
 print(f"  {'Total trainable':25s}: {total_trainable:>10,} params")
 print(f"  Training steps: {total_steps} | Warmup: {warmup_steps}")
-print(f"\n  FIXES vs Script 14:")
-print(f"    [A] Unfrozen layers:  6 -> {cfg.UNFREEZE_LAST_N_LAYERS}")
-print(f"    [B] Fusion dropout:   0.3 -> {cfg.FUSION_DROPOUT}")
-print(f"    [C] R-Drop alpha:     {cfg.RDROP_ALPHA}")
-print(f"    [D] Weight decay:     0.1 -> {cfg.WEIGHT_DECAY}")
-print(f"    [E] Grad clip:        1.0 -> {cfg.MAX_GRAD_NORM}")
-print(f"    [F] Backbone LR:      1e-5 -> {cfg.BACKBONE_LR}")
-print(f"    [G] Classifier:       MLP -> ChebyKAN(degree={cfg.KAN_DEGREE})")
-print(f"    [H] Cross-Attn:       1 -> {cfg.CROSS_ATTN_LAYERS} layers + DropPath({cfg.DROP_PATH_RATE})")
-print(f"    [I] Shape pos embed:  NEW")
-print(f"    [J] Attn pooling:     NEW (replaces mean pool for seq)")
-print(f"    [K] Loss:             CE -> Focal(gamma={cfg.FOCAL_GAMMA})")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 10: Training Loop with R-Drop & Focal Loss
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_rdrop_kl(logits1, logits2):
-    """Symmetric KL divergence for R-Drop regularization."""
     p1 = F.log_softmax(logits1, dim=-1)
     p2 = F.log_softmax(logits2, dim=-1)
     kl1 = F.kl_div(p1, p2.detach().exp(), reduction='batchmean')
@@ -1054,8 +935,7 @@ def compute_rdrop_kl(logits1, logits2):
 
 
 def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
-                    scaler, device, grad_accum_steps, rdrop_alpha=1.0, max_grad_norm=0.5):
-    """Train with R-Drop regularization (dual forward pass + KL divergence)."""
+                    device, grad_accum_steps, rdrop_alpha=1.0, max_grad_norm=0.5):
     model.train()
     running_loss = 0.0
     running_ce = 0.0
@@ -1064,55 +944,57 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
     total = 0
     optimizer.zero_grad()
 
-    pbar = tqdm(train_loader, desc="  Training", leave=False)
+    pbar = tqdm(train_loader, desc="  Training", leave=False, disable=not accelerator.is_main_process)
     for step, batch in enumerate(pbar):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
 
-        with autocast(enabled=(device.type == "cuda")):
-            # R-Drop: Two forward passes with different dropout masks
-            logits1 = model(input_ids, attention_mask, shape_features)
-            logits2 = model(input_ids, attention_mask, shape_features)
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                logits1 = model(input_ids, attention_mask, shape_features)
+                logits2 = model(input_ids, attention_mask, shape_features)
 
-            # Focal Loss on both outputs
-            loss1 = criterion(logits1, labels)
-            loss2 = criterion(logits2, labels)
-            ce_loss = (loss1 + loss2) / 2
+                loss1 = criterion(logits1, labels)
+                loss2 = criterion(logits2, labels)
+                ce_loss = (loss1 + loss2) / 2
 
-            # KL divergence between the two distributions
-            kl_loss = compute_rdrop_kl(logits1, logits2)
+                kl_loss = compute_rdrop_kl(logits1, logits2)
+                loss = ce_loss + rdrop_alpha * kl_loss
 
-            # Total loss
-            loss = ce_loss + rdrop_alpha * kl_loss
-            loss = loss / grad_accum_steps
+            accelerator.backward(loss)
 
-        scaler.scale(loss).backward()
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        batch_loss = loss.item() * grad_accum_steps
-        running_loss += batch_loss * labels.size(0)
-        running_ce += ce_loss.item() * labels.size(0)
-        running_kl += kl_loss.item() * labels.size(0)
+        # Gather metrics across processes for accurate training log
+        with torch.no_grad():
+            t_loss = torch.tensor([loss.item() * grad_accum_steps], device=device)
+            t_ce = torch.tensor([ce_loss.item()], device=device)
+            t_kl = torch.tensor([kl_loss.item()], device=device)
+            logits_g, labels_g, loss_g, ce_g, kl_g = accelerator.gather_for_metrics(
+                (logits1, labels, t_loss, t_ce, t_kl)
+            )
 
-        # Use logits1 for accuracy tracking
-        _, predicted = logits1.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+            running_loss += loss_g.mean().item() * labels_g.size(0)
+            running_ce += ce_g.mean().item() * labels_g.size(0)
+            running_kl += kl_g.mean().item() * labels_g.size(0)
 
-        pbar.set_postfix({
-            "loss": f"{running_loss/total:.4f}",
-            "acc": f"{correct/total:.4f}",
-            "kl": f"{running_kl/total:.4f}",
-        })
+            _, predicted = logits_g.max(1)
+            total += labels_g.size(0)
+            correct += predicted.eq(labels_g).sum().item()
+
+        if accelerator.is_main_process:
+            pbar.set_postfix({
+                "loss": f"{running_loss/total:.4f}",
+                "acc": f"{correct/total:.4f}",
+                "kl": f"{running_kl/total:.4f}",
+            })
 
     return running_loss / total, correct / total, running_ce / total, running_kl / total
 
@@ -1120,29 +1002,32 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
 @torch.no_grad()
 def evaluate(model, test_loader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    all_logits = []
+    all_labels = []
     for batch in test_loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
-            loss = criterion(logits, labels)
 
-        running_loss += loss.item() * labels.size(0)
-        _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        logits_gathered, labels_gathered = accelerator.gather_for_metrics((logits, labels))
+        all_logits.append(logits_gathered.cpu())
+        all_labels.append(labels_gathered.cpu())
 
-    return running_loss / total, correct / total
+    all_logits = torch.cat(all_logits, dim=0).to(device)
+    all_labels = torch.cat(all_labels, dim=0).to(device)
+
+    val_loss = criterion(all_logits, all_labels).item()
+    preds = all_logits.argmax(dim=1)
+    val_acc = (preds == all_labels).float().mean().item()
+    return val_loss, val_acc
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, scaler, cfg, device):
+                criterion, cfg, device):
     print("\n" + "=" * 60)
     print("TRAINING -- KAN-Regularized Cross-Modal Attention")
     print("=" * 60)
@@ -1158,7 +1043,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
 
         train_loss, train_acc, ce_loss, kl_loss = train_one_epoch(
             model, train_loader, optimizer, scheduler, criterion,
-            scaler, device, cfg.GRAD_ACCUM_STEPS,
+            device, cfg.GRAD_ACCUM_STEPS,
             rdrop_alpha=cfg.RDROP_ALPHA, max_grad_norm=cfg.MAX_GRAD_NORM,
         )
         val_loss, val_acc = evaluate(model, test_loader, criterion, device)
@@ -1171,13 +1056,13 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["ce_loss"].append(ce_loss)
         history["kl_loss"].append(kl_loss)
 
-        gap = train_acc - val_acc
+        gap_percent = (train_acc - val_acc) * 100
 
         print(
             f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
             f"Train: {train_loss:.4f}/{train_acc:.4f} | "
             f"Val: {val_loss:.4f}/{val_acc:.4f} | "
-            f"Gap: {gap:.2%} | KL: {kl_loss:.4f} | "
+            f"Gap: {gap_percent:+.2f}% | "
             f"LR: {optimizer.param_groups[0]['lr']:.1e} | {elapsed:.0f}s"
         )
 
@@ -1185,13 +1070,16 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-            }, os.path.join(cfg.MODEL_DIR, "best_kan_crossmodal.pt"))
-            print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap:.2%})")
+            if accelerator.is_main_process:
+                unwrapped = accelerator.unwrap_model(model)
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": unwrapped.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }, os.path.join(cfg.MODEL_DIR, "best_kan_crossmodal.pt"))
+                print(f"  -> Saved best (val_acc={val_acc:.4f}, gap={gap_percent/100:.2%})")
+            accelerator.wait_for_everyone()
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
@@ -1202,7 +1090,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
     return history
 
 
-history = train_model(model, train_loader, test_loader, optimizer, scheduler, criterion, scaler, cfg, DEVICE)
+history = train_model(model, train_loader, test_loader, optimizer, scheduler, criterion, cfg, DEVICE)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 11: Load Best Model & Full Evaluation
@@ -1210,8 +1098,8 @@ history = train_model(model, train_loader, test_loader, optimizer, scheduler, cr
 
 best_path = os.path.join(cfg.MODEL_DIR, "best_kan_crossmodal.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
-model.load_state_dict(checkpoint["model_state_dict"])
-model = model.to(DEVICE)
+unwrapped = accelerator.unwrap_model(model)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 print(f"Loaded best model from epoch {checkpoint['epoch']} "
       f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
@@ -1220,42 +1108,47 @@ print(f"Loaded best model from epoch {checkpoint['epoch']} "
 @torch.no_grad()
 def full_evaluation(model, test_loader, class_names, device):
     all_preds, all_targets, all_probs = [], [], []
-    for batch in tqdm(test_loader, desc="  Evaluating"):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
+    for batch in tqdm(test_loader, desc="  Evaluating", disable=not accelerator.is_main_process):
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
         labels = batch["labels"]
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
         probs = torch.softmax(logits.float(), dim=1)
         _, preds = logits.max(1)
 
-        all_preds.extend(preds.cpu().numpy())
-        all_targets.extend(labels.numpy())
-        all_probs.extend(probs.cpu().numpy())
+        # Gather
+        preds_g, labels_g, probs_g = accelerator.gather_for_metrics((preds, labels, probs))
+
+        all_preds.extend(preds_g.cpu().numpy())
+        all_targets.extend(labels_g.cpu().numpy())
+        all_probs.extend(probs_g.cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
     all_probs = np.array(all_probs)
 
-    print("\n" + "=" * 60)
-    print("CLASSIFICATION REPORT")
-    print("=" * 60)
-    report_str = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
-    print(report_str)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("CLASSIFICATION REPORT")
+        print("=" * 60)
+        report_str = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
+        print(report_str)
 
-    report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
-    with open(report_path, "w") as f:
-        f.write("CLASSIFICATION REPORT -- KAN-Regularized Cross-Modal Attention\n")
-        f.write("=" * 60 + "\n")
-        f.write(report_str)
-    print(f"  -> Report saved: {report_path}")
+        report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
+        with open(report_path, "w") as f:
+            f.write("CLASSIFICATION REPORT -- KAN-Regularized Cross-Modal Attention\n")
+            f.write("=" * 60 + "\n")
+            f.write(report_str)
+        print(f"  -> Report saved: {report_path}")
 
-    acc = accuracy_score(all_targets, all_preds)
-    f1_macro = f1_score(all_targets, all_preds, average="macro")
-    print(f"Overall Accuracy:  {acc:.4f}")
-    print(f"Macro F1-Score:    {f1_macro:.4f}")
+        acc = accuracy_score(all_targets, all_preds)
+        f1_macro = f1_score(all_targets, all_preds, average="macro")
+        print(f"Overall Accuracy:  {acc:.4f}")
+        print(f"Macro F1-Score:    {f1_macro:.4f}")
+
     return all_preds, all_targets, all_probs
 
 
@@ -1286,8 +1179,9 @@ def export_igv_bed_files(headers_test, predictions, targets, output_dir):
             f.writelines(lines)
         print(f"    {name}.bed: {len(lines)} lines")
 
-print("\n  BED files:")
-export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
+if accelerator.is_main_process:
+    print("\n  BED files:")
+    export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 12: Generate All Performance Figures
@@ -1420,14 +1314,15 @@ def plot_per_class_bar(all_targets, all_preds, class_names, save_dir):
     print(f"  -> Per-class: {path}")
 
 
-print("\n" + "=" * 60)
-print("GENERATING FIGURES")
-print("=" * 60)
-plot_training_curves(history, cfg.FIG_DIR)
-plot_confusion_matrix(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_roc_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_pr_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_per_class_bar(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
+if accelerator.is_main_process:
+    print("\n" + "=" * 60)
+    print("GENERATING FIGURES")
+    print("=" * 60)
+    plot_training_curves(history, cfg.FIG_DIR)
+    plot_confusion_matrix(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_roc_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_pr_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_per_class_bar(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 13: Summary & Comparison
@@ -1440,23 +1335,10 @@ print("\n" + "=" * 60)
 print("PIPELINE SUMMARY -- KAN-Regularized Cross-Modal Attention")
 print("=" * 60)
 print(f"  Architecture:      KAN Cross-Modal Dual-Branch")
-print(f"  DNABERT-2:         Last {cfg.UNFREEZE_LAST_N_LAYERS} layers (was 6)")
+print(f"  DNABERT-2:         Last {cfg.UNFREEZE_LAST_N_LAYERS} layers")
 print(f"  Cross-Attention:   {cfg.CROSS_ATTN_LAYERS} layers, DropPath={cfg.DROP_PATH_RATE}")
 print(f"  Classifier:        ChebyKAN(degree={cfg.KAN_DEGREE}, hidden={cfg.KAN_HIDDEN_DIM})")
 print(f"  Regularization:    R-Drop(a={cfg.RDROP_ALPHA}) + Focal(g={cfg.FOCAL_GAMMA}) + WD={cfg.WEIGHT_DECAY}")
 print(f"  Best val_acc:      {checkpoint['val_acc']:.4f}")
-print(f"  Overfitting gap:   {final_gap:.2%} (was 34% in Script 14)")
+print(f"  Overfitting gap:   {final_gap:.2%}")
 print()
-print("  +-----------------------------------------------------------+")
-print("  |  COMPARISON                                               |")
-print("  +-----------------------------------------------------------+")
-print("  |  Sc.12: Balanced Dual-Branch (torch.cat)                  |")
-print("  |    -> Val Acc: ~50.33%   Gap: ~30%                        |")
-print("  |                                                           |")
-print("  |  Sc.14: Cross-Modal Attention                             |")
-print("  |    -> Val Acc: 61.33%    Gap: ~34%                        |")
-print("  |                                                           |")
-print("  |  Sc.15: KAN + Anti-Overfitting Cross-Modal                |")
-print(f"  |    -> Val Acc: {checkpoint['val_acc']:.2%}    Gap: {final_gap:.0%}{'':20s}|")
-print("  +-----------------------------------------------------------+")
-print("=" * 60)

@@ -23,6 +23,9 @@ ARCHITECTURE: Identical to Script 12 (Balanced Dual-Branch) except:
   - NUM_CLASSES = 2
   - Labels remapped to binary
   - Fewer epochs (10) since this is just a diagnostic
+
+Required packages (auto-installed):
+  pip install transformers einops datasets accelerate safetensors
 """
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -56,6 +59,15 @@ install_packages()
 # ═══════════════════════════════════════════════════════════════════════
 
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 import gc
 import math
 import time
@@ -70,7 +82,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
@@ -151,32 +162,32 @@ class Config:
     EMBEDDING_DIM = 768
     MAX_TOKEN_LENGTH = 512
 
-    # ── Fine-Tuning Strategy (same as Script 12) ──
+    # ── Fine-Tuning Strategy ──
     UNFREEZE_LAST_N_LAYERS = 3
-    BACKBONE_LR = 1.5e-5          # Reduced slightly
-    SHAPE_LR = 1e-4               # Reduced from 5e-4 to 1e-4 (slower Shape CNN learning)
-    HEAD_LR = 5e-5                # Reduced from 2e-4 to 5e-5 (slower head learning)
-    WEIGHT_DECAY = 0.1            # Increased from 0.05 to 0.1 (stronger regularization)
+    BACKBONE_LR = 1.5e-5          
+    SHAPE_LR = 1e-4               
+    HEAD_LR = 5e-5                
+    WEIGHT_DECAY = 0.1            
 
-    # ── DNAshape Branch (same as Script 12) ──
+    # ── DNAshape Branch ──
     SHAPE_CHANNELS = 5
     SHAPE_SEQ_LEN = 101
     SHAPE_CONV_CHANNELS = [32, 64, 128]
     SHAPE_OUTPUT_DIM = 128
 
-    # ── Projection Layer (same as Script 12) ──
+    # ── Projection Layer ──
     BERT_PROJ_DIM = 256
     BERT_DROPOUT = 0.5
     SHAPE_DROPOUT = 0.1
 
-    # ── Fusion Head — ★ CHANGED: 2 classes ──
+    # ── Fusion Head ──
     FUSION_DIM = 256 + 128        # 384
     HIDDEN_DIM = 256
     DROPOUT_RATE = 0.3
     LABEL_SMOOTHING = 0.1
     NUM_CLASSES = 2               # ★ BINARY: Positive vs Negative
 
-    # ── Training — shorter for diagnostic ──
+    # ── Training ──
     BATCH_SIZE = 16
     GRAD_ACCUM_STEPS = 4
     EPOCHS = 10                   # ★ Reduced: diagnostic only
@@ -187,7 +198,7 @@ class Config:
     TEST_SIZE = 0.2
     RANDOM_SEED = 42
 
-    # ── Class Names — ★ BINARY ──
+    # ── Class Names ──
     CLASS_NAMES = ["Negative", "Positive"]
 
     # ── DNAshape NPY files ──
@@ -211,13 +222,27 @@ torch.manual_seed(cfg.RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.RANDOM_SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    gradient_accumulation_steps=cfg.GRAD_ACCUM_STEPS,
+    kwargs_handlers=[ddp_kwargs],
+)
+DEVICE = accelerator.device
+
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
 print(f"\nUsing device: {DEVICE}")
 print(f"★ BINARY SANITY CHECK: Positive (SP1+SP2+SP4) vs Negative")
 print(f"  NUM_CLASSES = {cfg.NUM_CLASSES}")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 3: Data Loading — ★ BINARY label remapping
+# CELL 3: Data Loading
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_fasta(filepath):
@@ -244,7 +269,6 @@ def load_shape_features(data_dir, shape_files):
     """Load pre-computed DNAshape feature matrices (.npy)."""
     all_shapes = []
     
-    # Dynamically find the negative shape file if it exists under another name
     neg_shape_path = None
     neg_candidates = ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]
     for cand in neg_candidates:
@@ -277,12 +301,11 @@ def load_shape_features(data_dir, shape_files):
 
 
 def load_all_data(fasta_dir, shape_dir, shape_files):
-    """Load classes, then REMAP to binary labels (optionally only SP1)."""
+    """Load classes, then REMAP to binary labels."""
     print("=" * 60)
     print("LOADING DATASETS — BINARY SANITY CHECK")
     print("=" * 60)
 
-    # Detect negative FASTA file
     neg_fasta_path = None
     fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
     for cand in fasta_candidates:
@@ -301,7 +324,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
             "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
             "Negative": neg_fasta_path,
         }
-        # Filter shape_files to only SP1 and Negative
         shape_files = {k: v for k, v in shape_files.items() if k in ["SP1", "Negative"]}
         binary_map = {"SP1": 1, "Negative": 0}
         print("  ★ TASK CONFIGURATION: ONLY SP1 vs Negative (SP2/SP4 excluded)")
@@ -315,7 +337,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         binary_map = {"SP1": 1, "SP2": 1, "SP4": 1, "Negative": 0}
         print("  ★ TASK CONFIGURATION: SP1+SP2+SP4 vs Negative")
 
-    # Verify all are resolved
     for cls_name, fpath in fasta_files.items():
         if not fpath:
             raise FileNotFoundError(f"Missing FASTA file for {cls_name}")
@@ -332,7 +353,7 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         all_sequences.extend(seqs)
         all_labels.extend([binary_label] * len(seqs))
 
-        # Build group IDs (same logic as Script 12)
+        # Build group IDs
         if cls_name != "Negative":
             for i in range(0, len(seqs), 2):
                 all_groups.extend([group_id, group_id])
@@ -345,7 +366,6 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     all_labels = np.array(all_labels)
     all_groups = np.array(all_groups)
 
-    # Load shape features
     print("\n  Loading DNAshape features...")
     all_shapes = load_shape_features(shape_dir, shape_files)
 
@@ -520,7 +540,7 @@ def patch_flash_attention():
         print("  ⚠️  No flash-attention references found to patch.")
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 6: Load DNABERT-2 Backbone (same as Script 12)
+# CELL 6: Load DNABERT-2 Backbone
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_dnabert2(model_name, device, unfreeze_last_n=3):
@@ -589,7 +609,7 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
             print(f"  Strategy 2 failed: {e}")
             model = None
 
-    # Strategy 3: Monkey-patch
+    # Strategy 3: Monkey-patch ALiBi
     if model is None:
         try:
             print("  Trying Strategy 3 (monkey-patch ALiBi)...")
@@ -616,7 +636,7 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
 
     patch_flash_attention()
 
-    # Selective Freezing / Unfreezing
+    # Selective Freezing
     for param in model.parameters():
         param.requires_grad = False
 
@@ -659,7 +679,7 @@ dnabert_model, tokenizer = load_dnabert2(
 )
 
 # ═══════════════════════════════════════════════════════════════════════
-# CELL 7: Balanced DualBranch Architecture (same as Script 12)
+# CELL 7: Balanced DualBranch Architecture
 # ═══════════════════════════════════════════════════════════════════════
 
 class ShapeCNN(nn.Module):
@@ -830,10 +850,9 @@ model = BalancedDualBranchClassifier(
     bert_dropout=cfg.BERT_DROPOUT,
     shape_dropout=cfg.SHAPE_DROPOUT,
     hidden_dim=cfg.HIDDEN_DIM,
-    num_classes=cfg.NUM_CLASSES,        # ★ 2 instead of 4
+    num_classes=cfg.NUM_CLASSES,
     fusion_dropout=cfg.DROPOUT_RATE,
 )
-model = model.to(DEVICE)
 
 # 4-Group Parameter Separation
 backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -871,7 +890,10 @@ class_weights = torch.tensor([w_neg, w_pos], dtype=torch.float32, device=DEVICE)
 print(f"  [Auto-detect] Class weights for loss function: Neg={w_neg:.4f}, Pos={w_pos:.4f}")
 
 criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.LABEL_SMOOTHING)
-scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+
+model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+    model, optimizer, train_loader, test_loader, scheduler
+)
 
 # Print model summary
 backbone_trainable = sum(p.numel() for p in backbone_params)
@@ -897,55 +919,51 @@ print(f"  Warmup steps:                   {warmup_steps}")
 # CELL 10: Training Loop
 # ═══════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
-                    scaler, device, grad_accum_steps):
+def train_one_epoch(model, train_loader, optimizer, scheduler, criterion, device):
+    """Train for one epoch with gradient accumulation (dual-input)."""
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    optimizer.zero_grad()
+    train_loss_sum, train_total = 0.0, 0
+    all_train_preds, all_train_targets = [], []
 
-    pbar = tqdm(train_loader, desc="  Training", leave=False)
-    for step, batch in enumerate(pbar):
+    for step, batch in enumerate(train_loader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         shape_features = batch["shape_features"].to(device)
         labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
-            logits = model(input_ids, attention_mask, shape_features)
-            loss = criterion(logits, labels)
-            loss = loss / grad_accum_steps
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                logits = model(input_ids, attention_mask, shape_features)
+                loss = criterion(logits, labels)
 
-        scaler.scale(loss).backward()
-
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        running_loss += loss.item() * grad_accum_steps * labels.size(0)
+        # Gather metrics
         _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
+        loss_gathered = accelerator.gather(loss).mean().item()
 
-        pbar.set_postfix({
-            "loss": f"{running_loss/total:.4f}",
-            "acc": f"{correct/total:.4f}",
-        })
+        train_loss_sum += loss_gathered * targets_gathered.size(0)
+        train_total += targets_gathered.size(0)
+        all_train_preds.extend(preds_gathered.cpu().numpy())
+        all_train_targets.extend(targets_gathered.cpu().numpy())
 
-    return running_loss / total, correct / total
+    train_loss = train_loss_sum / train_total
+    train_acc = accuracy_score(all_train_targets, all_train_preds)
+    return train_loss, train_acc
 
 
 @torch.no_grad()
 def evaluate(model, test_loader, criterion, device):
+    """Evaluate on validation/test set (dual-input)."""
     model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    val_loss_sum, val_total = 0.0, 0
+    all_val_preds, all_val_targets = [], []
 
     for batch in test_loader:
         input_ids = batch["input_ids"].to(device)
@@ -953,20 +971,28 @@ def evaluate(model, test_loader, criterion, device):
         shape_features = batch["shape_features"].to(device)
         labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
             loss = criterion(logits, labels)
 
-        running_loss += loss.item() * labels.size(0)
+        # Gather metrics
         _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
+        loss_gathered = accelerator.gather(loss).mean().item()
 
-    return running_loss / total, correct / total
+        val_loss_sum += loss_gathered * targets_gathered.size(0)
+        val_total += targets_gathered.size(0)
+        all_val_preds.extend(preds_gathered.cpu().numpy())
+        all_val_targets.extend(targets_gathered.cpu().numpy())
+
+    val_loss = val_loss_sum / val_total
+    val_acc = accuracy_score(all_val_targets, all_val_preds)
+    return val_loss, val_acc
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, scaler, cfg, device):
+                criterion, cfg, device):
+    """Full training loop with early stopping."""
     print("\n" + "=" * 60)
     print("TRAINING — Binary Sanity Check (Positive vs Negative)")
     print("=" * 60)
@@ -980,8 +1006,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion,
-            scaler, device, cfg.GRAD_ACCUM_STEPS,
+            model, train_loader, optimizer, scheduler, criterion, device
         )
 
         val_loss, val_acc = evaluate(model, test_loader, criterion, device)
@@ -994,43 +1019,46 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["val_acc"].append(val_acc)
 
         backbone_lr = optimizer.param_groups[0]["lr"]
-        shape_lr = optimizer.param_groups[1]["lr"]
-        head_lr = optimizer.param_groups[3]["lr"]
+        gap_percent = (train_acc - val_acc) * 100
 
         print(
-            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} │ "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} │ "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f} │ "
-            f"LR: {backbone_lr:.1e}/{shape_lr:.1e}/{head_lr:.1e} │ {elapsed:.1f}s"
+            f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
+            f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+            f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+            f"Gap: {gap_percent:+.2f}% | "
+            f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
         )
 
+        # Checkpoint based on val_loss
+        accelerator.wait_for_everyone()
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
             ckpt_path = os.path.join(cfg.MODEL_DIR, "best_binary_sanity.pt")
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-            }, ckpt_path)
-            print(f"  → Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
+            if accelerator.is_main_process:
+                unwrapped = accelerator.unwrap_model(model)
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": unwrapped.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }, ckpt_path)
+                print(f"  → Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
                 print(f"\n  ⏹ Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
+        accelerator.wait_for_everyone()
 
-    print(f"\nTraining complete.")
-    print(f"  Best val_loss: {best_val_loss:.4f}")
-    print(f"  Best val_acc:  {best_val_acc:.4f}")
+    print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
 history = train_model(
     model, train_loader, test_loader, optimizer, scheduler,
-    criterion, scaler, cfg, DEVICE,
+    criterion, cfg, DEVICE,
 )
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1039,8 +1067,9 @@ history = train_model(
 
 best_path = os.path.join(cfg.MODEL_DIR, "best_binary_sanity.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
-model.load_state_dict(checkpoint["model_state_dict"])
-model = model.to(DEVICE)
+unwrapped = accelerator.unwrap_model(model)
+unwrapped.load_state_dict(checkpoint["model_state_dict"])
+model = unwrapped
 model.eval()
 print(f"Loaded best model from epoch {checkpoint['epoch']} "
       f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
@@ -1048,22 +1077,27 @@ print(f"Loaded best model from epoch {checkpoint['epoch']} "
 
 @torch.no_grad()
 def full_evaluation(model, test_loader, class_names, device):
+    """Run full evaluation and return predictions/probabilities (dual-input)."""
     all_preds, all_targets, all_probs = [], [], []
 
     for batch in tqdm(test_loader, desc="  Evaluating"):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"]
+        labels = batch["labels"].to(device)
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
         probs = torch.softmax(logits.float(), dim=1)
         _, preds = logits.max(1)
 
-        all_preds.extend(preds.cpu().numpy())
-        all_targets.extend(labels.numpy())
-        all_probs.extend(probs.cpu().numpy())
+        # Gather metrics across GPUs
+        preds_gathered, targets_gathered = accelerator.gather_for_metrics((preds, labels))
+        probs_gathered = accelerator.gather_for_metrics(probs)
+
+        all_preds.extend(preds_gathered.cpu().numpy())
+        all_targets.extend(targets_gathered.cpu().numpy())
+        all_probs.extend(probs_gathered.cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
@@ -1076,21 +1110,22 @@ def full_evaluation(model, test_loader, class_names, device):
     print(report_str)
 
     # Save report
-    report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report_binary.txt")
-    with open(report_path, "w") as f:
-        f.write("CLASSIFICATION REPORT — Binary Sanity Check\n")
-        f.write("=" * 60 + "\n")
-        f.write(f"Positive = SP1 + SP2 + SP4 (merged)\n")
-        f.write(f"Negative = Negative\n\n")
-        f.write(report_str)
-    print(f"  → Classification report saved to: {report_path}")
+    if accelerator.is_main_process:
+        report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report_binary.txt")
+        with open(report_path, "w") as f:
+            f.write("CLASSIFICATION REPORT — Binary Sanity Check\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"Positive = SP1 + SP2 + SP4 (merged)\n")
+            f.write(f"Negative = Negative\n\n")
+            f.write(report_str)
+        print(f"  → Classification report saved to: {report_path}")
 
     acc = accuracy_score(all_targets, all_preds)
     f1_macro = f1_score(all_targets, all_preds, average="macro")
     print(f"Overall Accuracy:  {acc:.4f}")
     print(f"Macro F1-Score:    {f1_macro:.4f}")
 
-    # ★ DIAGNOSTIC VERDICT
+    # DIAGNOSTIC VERDICT
     print("\n" + "=" * 60)
     print("★ DIAGNOSTIC VERDICT")
     print("=" * 60)
