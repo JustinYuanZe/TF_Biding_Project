@@ -83,6 +83,12 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 from sklearn.preprocessing import label_binarize
+
+# Mask triton to force DNABERT-2 to fallback to standard PyTorch attention
+# and avoid Triton-based compilation errors.
+import sys
+sys.modules['triton'] = None
+
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from tqdm import tqdm
 
