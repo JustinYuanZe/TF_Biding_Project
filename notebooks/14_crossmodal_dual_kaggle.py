@@ -1126,11 +1126,13 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         cross_lr = optimizer.param_groups[3]["lr"]
         head_lr = optimizer.param_groups[4]["lr"]
 
+        gap = (train_acc - val_acc) * 100
         print(
             f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f} | "
-            f"LR: {backbone_lr:.1e}/{cross_lr:.1e}/{head_lr:.1e} | {elapsed:.1f}s"
+            f"Train: {train_loss:.4f}/{train_acc:.4f} | "
+            f"Val: {val_loss:.4f}/{val_acc:.4f} | "
+            f"Gap: {gap:+.2f}% | "
+            f"LR: {backbone_lr:.1e} | {elapsed:.0f}s"
         )
 
         if val_acc > best_val_acc:
