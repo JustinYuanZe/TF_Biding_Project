@@ -397,6 +397,7 @@ def main():
     parser.add_argument("--bg_size", type=int, default=50, help="Background sample size for SHAP")
     parser.add_argument("--num_explain", type=int, default=20, help="Number of test samples to explain")
     parser.add_argument("--absolute", action="store_true", help="Calculate absolute position-wise SHAP (no GC-box alignment)")
+    parser.add_argument("--target_class", type=int, default=2, choices=[0, 1, 2], help="Target class index to explain: 0 for SP1, 1 for SP2, 2 for SP4")
     parser.add_argument("--model_path", type=str, default="outputs_gcmab_mscnn/models/best_gcmab_mscnn.pt", help="Path to best_gcmab_mscnn.pt")
     parser.add_argument("--output_dir", type=str, default="outputs_gcmab_mscnn/figures", help="Directory to save figures")
     args = parser.parse_args()
@@ -524,7 +525,9 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     # Predictions
-    print("Running evaluation to identify correctly predicted vs confused SP4 samples...")
+    target_class = args.target_class
+    target_name = classes[target_class]
+    print(f"Running evaluation to identify correctly predicted vs confused {target_name} samples...")
     all_preds = []
     all_targets = []
     
@@ -541,21 +544,24 @@ def main():
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
 
-    sp4_class_idx = 2
     subset_A_indices = []
     subset_B_indices = []
     
+    # We want subset B to contain samples of target_class that were confused with OTHER TF family classes.
+    # TF family classes are [0, 1, 2] (SP1, SP2, SP4). Negative is 3.
+    other_tf_classes = [c for c in [0, 1, 2] if c != target_class]
+    
     for idx in range(len(all_targets)):
-        if all_targets[idx] == sp4_class_idx:
+        if all_targets[idx] == target_class:
             pred = all_preds[idx]
-            if pred == sp4_class_idx:
+            if pred == target_class:
                 subset_A_indices.append(idx)
-            elif pred in [0, 1]:
+            elif pred in other_tf_classes:
                 subset_B_indices.append(idx)
                 
-    print(f"Found {len(subset_A_indices)} correct SP4, {len(subset_B_indices)} confused SP4.")
+    print(f"Found {len(subset_A_indices)} correct {target_name}, {len(subset_B_indices)} confused {target_name} (predicted as {other_tf_classes}).")
     if len(subset_A_indices) == 0 or len(subset_B_indices) == 0:
-        print("Error: Subset A or B is empty. Cannot run comparative SHAP.")
+        print(f"Error: Subset A or B is empty for target class {target_name}. Cannot run comparative SHAP.")
         return
 
     # Background
@@ -597,20 +603,20 @@ def main():
     if isinstance(shap_values_A, list) and len(shap_values_A) == 2:
         seq_shap_A = shap_values_A[0]
         shape_shap_A = shap_values_A[1]
-        if seq_shap_A.ndim > 3: seq_shap_A = seq_shap_A[..., sp4_class_idx]
-        if shape_shap_A.ndim > 3: shape_shap_A = shape_shap_A[..., sp4_class_idx]
+        if seq_shap_A.ndim > 3: seq_shap_A = seq_shap_A[..., target_class]
+        if shape_shap_A.ndim > 3: shape_shap_A = shape_shap_A[..., target_class]
     else:
-        seq_shap_A = shap_values_A[sp4_class_idx][0]
-        shape_shap_A = shap_values_A[sp4_class_idx][1]
+        seq_shap_A = shap_values_A[target_class][0]
+        shape_shap_A = shap_values_A[target_class][1]
 
     if isinstance(shap_values_B, list) and len(shap_values_B) == 2:
         seq_shap_B = shap_values_B[0]
         shape_shap_B = shap_values_B[1]
-        if seq_shap_B.ndim > 3: seq_shap_B = seq_shap_B[..., sp4_class_idx]
-        if shape_shap_B.ndim > 3: shape_shap_B = shape_shap_B[..., sp4_class_idx]
+        if seq_shap_B.ndim > 3: seq_shap_B = seq_shap_B[..., target_class]
+        if shape_shap_B.ndim > 3: shape_shap_B = shape_shap_B[..., target_class]
     else:
-        seq_shap_B = shap_values_B[sp4_class_idx][0]
-        shape_shap_B = shap_values_B[sp4_class_idx][1]
+        seq_shap_B = shap_values_B[target_class][0]
+        shape_shap_B = shap_values_B[target_class][1]
 
     # Plot DNAshape Feature Importance
     importance_shape_A = np.abs(shape_shap_A).sum(axis=2).mean(axis=0)
@@ -620,15 +626,15 @@ def main():
     width = 0.35
     
     plt.figure(figsize=(8, 5))
-    plt.bar(x - width/2, importance_shape_A, width, label="Subset A (Correct SP4)", color="#4CAF50")
+    plt.bar(x - width/2, importance_shape_A, width, label=f"Subset A (Correct {target_name})", color="#4CAF50")
     plt.bar(x + width/2, importance_shape_B, width, label="Subset B (Confused)", color="#F44336")
     plt.xticks(x, features)
     plt.ylabel("Mean Absolute SHAP Value")
-    plt.title("DNAshape Feature Importance (Subset A vs Subset B)")
+    plt.title(f"DNAshape Feature Importance (Subset A vs Subset B) for {target_name}")
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.3)
     plt.tight_layout()
-    bar_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_dnashape_bar_w{args.window_size}.png")
+    bar_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_dnashape_bar_w{args.window_size}_{target_name}.png")
     plt.savefig(bar_path, dpi=150)
     plt.close()
     print(f"Saved: {bar_path}")
@@ -677,23 +683,23 @@ def main():
                     yticklabels=["Subset A (Correct)", "Subset B (Confused)"],
                     xticklabels=[str(i) for i in range(len(avg_aligned_A))])
         plt.xlabel("Absolute Nucleotide Position (0 to 100)")
-        plt.title("Sequence Context SHAP Importance (Absolute Positions)")
+        plt.title(f"Sequence Context SHAP Importance (Absolute Positions) for {target_name}")
         plt.tight_layout()
-        h_path = os.path.join(args.output_dir, "gcmab_mscnn_shap_sequence_heatmap_absolute.png")
+        h_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_sequence_heatmap_absolute_{target_name}.png")
         plt.savefig(h_path, dpi=150)
         plt.close()
         print(f"Saved: {h_path}")
         
         plt.figure(figsize=(10, 4))
-        plt.plot(range(len(avg_aligned_A)), avg_aligned_A, label="Subset A (Correct)", color="#4CAF50", linewidth=2)
+        plt.plot(range(len(avg_aligned_A)), avg_aligned_A, label=f"Subset A (Correct {target_name})", color="#4CAF50", linewidth=2)
         plt.plot(range(len(avg_aligned_B)), avg_aligned_B, label="Subset B (Confused)", color="#F44336", linewidth=2)
         plt.xlabel("Absolute Nucleotide Position (0 to 100)")
         plt.ylabel("Average SHAP Importance (L2 Norm)")
-        plt.title("Sequence Context SHAP Importance (Absolute Positions)")
+        plt.title(f"Sequence Context SHAP Importance (Absolute Positions) for {target_name}")
         plt.legend()
         plt.grid(True, linestyle="--", alpha=0.3)
         plt.tight_layout()
-        l_path = os.path.join(args.output_dir, "gcmab_mscnn_shap_sequence_line_absolute.png")
+        l_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_sequence_line_absolute_{target_name}.png")
         plt.savefig(l_path, dpi=150)
         plt.close()
         print(f"Saved: {l_path}")
@@ -730,25 +736,25 @@ def main():
                         yticklabels=["Subset A (Correct)", "Subset B (Confused)"],
                         xticklabels=x_labels)
             plt.xlabel("Position Relative to GC-box Center (bp)")
-            plt.title(f"Sequence Context SHAP Alignment (GC-box Flank Analysis, w={args.window_size})")
+            plt.title(f"Sequence Context SHAP Alignment ({target_name} GC-box Flank Analysis, w={args.window_size})")
             plt.tight_layout()
-            h_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_sequence_heatmap_w{args.window_size}.png")
+            h_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_sequence_heatmap_w{args.window_size}_{target_name}.png")
             plt.savefig(h_path, dpi=150)
             plt.close()
             print(f"Saved: {h_path}")
             
             plt.figure(figsize=(10, 4))
             offsets = np.arange(-args.window_size, args.window_size + 1)
-            plt.plot(offsets, avg_aligned_A, label="Subset A (Correct)", color="#4CAF50", linewidth=2)
+            plt.plot(offsets, avg_aligned_A, label=f"Subset A (Correct {target_name})", color="#4CAF50", linewidth=2)
             plt.plot(offsets, avg_aligned_B, label="Subset B (Confused)", color="#F44336", linewidth=2)
             plt.axvline(x=0, color="gray", linestyle="--", alpha=0.7, label="GC-box Center")
             plt.xlabel("Position Relative to GC-box Center (bp)")
             plt.ylabel("Average SHAP Importance (L2 Norm)")
-            plt.title(f"Sequence Context SHAP Importance (Flank Analysis, w={args.window_size})")
+            plt.title(f"Sequence Context SHAP Importance ({target_name} Flank Analysis, w={args.window_size})")
             plt.legend()
             plt.grid(True, linestyle="--", alpha=0.3)
             plt.tight_layout()
-            l_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_sequence_line_w{args.window_size}.png")
+            l_path = os.path.join(args.output_dir, f"gcmab_mscnn_shap_sequence_line_w{args.window_size}_{target_name}.png")
             plt.savefig(l_path, dpi=150)
             plt.close()
             print(f"Saved: {l_path}")
