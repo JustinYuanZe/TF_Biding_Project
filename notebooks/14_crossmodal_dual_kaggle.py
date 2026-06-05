@@ -67,12 +67,16 @@ install_packages()
 # ═══════════════════════════════════════════════════════════════════════
 
 import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import gc
 import math
 import time
 import random
+import sys
 import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -81,7 +85,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
@@ -97,7 +100,22 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from tqdm import tqdm
+
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
+# ── Initialize Accelerator ──
+from accelerate import Accelerator
+accelerator = Accelerator()
+DEVICE = accelerator.device
+
+# Redefine print globally to suppress non-main process logging in DDP/Multi-GPU
+if not accelerator.is_main_process:
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
 
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
@@ -911,15 +929,10 @@ model = CrossModalDualBranchClassifier(
 model = model.to(DEVICE)
 
 # ── 5-Group Parameter Separation ──
-# Group 1: DNABERT-2 backbone (unfrozen layers only)
 backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-# Group 2: Sequence projection (768 -> d_model)
 seq_proj_params = list(model.seq_projection.parameters())
-# Group 3: SpatialShapeCNN
 shape_params = list(model.shape_cnn.parameters())
-# Group 4: Cross-Modal Attention layers
 cross_attn_params = list(model.cross_attention_layers.parameters())
-# Group 5: Fusion classifier
 head_params = list(model.classifier.parameters())
 
 optimizer = optim.AdamW([
@@ -929,6 +942,11 @@ optimizer = optim.AdamW([
     {"params": cross_attn_params,  "lr": cfg.CROSS_ATTN_LR,  "weight_decay": cfg.WEIGHT_DECAY},
     {"params": head_params,        "lr": cfg.HEAD_LR,        "weight_decay": cfg.WEIGHT_DECAY},
 ])
+
+# Prepare model, optimizer, and loaders first with accelerator
+model, optimizer, train_loader, test_loader = accelerator.prepare(
+    model, optimizer, train_loader, test_loader
+)
 
 total_steps = (len(train_loader) // cfg.GRAD_ACCUM_STEPS) * cfg.EPOCHS
 warmup_steps = int(total_steps * cfg.WARMUP_RATIO)
@@ -941,6 +959,7 @@ def lr_lambda(current_step):
     return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+scheduler = accelerator.prepare(scheduler)
 
 # Class weights
 class_counts = np.bincount(y_train)
@@ -952,7 +971,6 @@ class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(num_classes)]))
 
 criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.LABEL_SMOOTHING)
-scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
 
 # Print model summary
 n_backbone = sum(p.numel() for p in backbone_params)
@@ -985,8 +1003,8 @@ print(f"    Late Pooling:   MeanPool AFTER cross-attention (not before)")
 # ═══════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
-                    scaler, device, grad_accum_steps):
-    """Train for one epoch with gradient accumulation and clean 1% progress logging."""
+                    accelerator, grad_accum_steps):
+    """Train for one epoch with gradient accumulation and clean 1% progress logging using Accelerator."""
     model.train()
     running_loss = 0.0
     correct = 0
@@ -997,76 +1015,83 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
     last_percent = -1
 
     for step, batch in enumerate(train_loader):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
 
-        with autocast(enabled=(device.type == "cuda")):
-            logits = model(input_ids, attention_mask, shape_features)
-            loss = criterion(logits, labels)
-            loss = loss / grad_accum_steps
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                logits = model(input_ids, attention_mask, shape_features)
+                loss = criterion(logits, labels)
 
-        scaler.scale(loss).backward()
+            accelerator.backward(loss)
 
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        running_loss += loss.item() * grad_accum_steps * labels.size(0)
+        # Update training metrics locally (not gathered to save communication overhead, identical to Script 20)
+        running_loss += loss.item() * labels.size(0)
         _, predicted = logits.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
-        # Update and print progress every 1% increment with a visual progress bar
+        # Update and print progress every 1% increment with a visual progress bar (only on main process)
         percent = int((step + 1) / total_steps * 100)
         if percent > last_percent:
-            bar_len = 20
-            filled_len = int(bar_len * percent / 100)
-            bar = "█" * filled_len + "░" * (bar_len - filled_len)
-            sys.stdout.write(f"\r  Training: [{bar}] {percent}% | Loss: {running_loss/total:.4f} | Acc: {correct/total:.4f}   ")
-            sys.stdout.flush()
+            if accelerator.is_main_process:
+                bar_len = 20
+                filled_len = int(bar_len * percent / 100)
+                bar = "█" * filled_len + "░" * (bar_len - filled_len)
+                sys.stdout.write(f"\r  Training: [{bar}] {percent}% | Loss: {running_loss/total:.4f} | Acc: {correct/total:.4f}   ")
+                sys.stdout.flush()
             last_percent = percent
 
     # Clear the temporary training line
-    sys.stdout.write("\r" + " " * 80 + "\r")
-    sys.stdout.flush()
+    if accelerator.is_main_process:
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
 
-    return running_loss / total, correct / total
+    return running_loss / max(total, 1), correct / max(total, 1)
 
 
 @torch.no_grad()
-def evaluate(model, test_loader, criterion, device):
-    """Evaluate on validation/test set."""
+def evaluate(model, test_loader, criterion, accelerator):
+    """Evaluate on validation/test set using Accelerator to gather metrics."""
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
 
     for batch in test_loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
             loss = criterion(logits, labels)
 
-        running_loss += loss.item() * labels.size(0)
         _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
 
-    return running_loss / total, correct / total
+        # Gather predictions, labels, and losses across all processes
+        predicted, labels_gathered = accelerator.gather_for_metrics((predicted, labels))
+        loss_gathered = accelerator.gather_for_metrics(loss.repeat(labels.size(0)))
+
+        running_loss += loss_gathered.sum().item()
+        total += labels_gathered.size(0)
+        correct += predicted.eq(labels_gathered).sum().item()
+
+    return running_loss / max(total, 1), correct / max(total, 1)
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, scaler, cfg, device):
+                criterion, accelerator, cfg):
     """Full training loop with early stopping on val_acc."""
     print("\n" + "=" * 60)
     print("TRAINING -- Cross-Modal Attention Dual-Branch")
@@ -1082,10 +1107,10 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
 
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, scheduler, criterion,
-            scaler, device, cfg.GRAD_ACCUM_STEPS,
+            accelerator, cfg.GRAD_ACCUM_STEPS,
         )
 
-        val_loss, val_acc = evaluate(model, test_loader, criterion, device)
+        val_loss, val_acc = evaluate(model, test_loader, criterion, accelerator)
 
         elapsed = time.time() - t0
 
@@ -1093,6 +1118,9 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
+
+        # Synchronize before printing and saving checkpoint
+        accelerator.wait_for_everyone()
 
         backbone_lr = optimizer.param_groups[0]["lr"]
         cross_lr = optimizer.param_groups[3]["lr"]
@@ -1109,19 +1137,26 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
-            ckpt_path = os.path.join(cfg.MODEL_DIR, "best_crossmodal_dual.pt")
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-            }, ckpt_path)
-            print(f"  -> Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
+            
+            # Save checkpoint only on the main process
+            if accelerator.is_main_process:
+                unwrapped_model = accelerator.unwrap_model(model)
+                ckpt_path = os.path.join(cfg.MODEL_DIR, "best_crossmodal_dual.pt")
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": unwrapped_model.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }, ckpt_path)
+                print(f"  -> Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
                 print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
+
+        # Synchronize after checkpoint operations
+        accelerator.wait_for_everyone()
 
     print(f"\nTraining complete.")
     print(f"  Best val_loss: {best_val_loss:.4f}")
@@ -1131,7 +1166,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
 
 history = train_model(
     model, train_loader, test_loader, optimizer, scheduler,
-    criterion, scaler, cfg, DEVICE,
+    criterion, accelerator, cfg,
 )
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1140,76 +1175,83 @@ history = train_model(
 
 best_path = os.path.join(cfg.MODEL_DIR, "best_crossmodal_dual.pt")
 checkpoint = torch.load(best_path, map_location=DEVICE)
-model.load_state_dict(checkpoint["model_state_dict"])
-model = model.to(DEVICE)
+unwrapped_model = accelerator.unwrap_model(model)
+unwrapped_model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 print(f"Loaded best model from epoch {checkpoint['epoch']} "
       f"(val_loss={checkpoint['val_loss']:.4f}, val_acc={checkpoint['val_acc']:.4f})")
 
 
 @torch.no_grad()
-def full_evaluation(model, test_loader, class_names, device):
-    """Run full evaluation and return predictions/probabilities."""
+def full_evaluation(model, test_loader, class_names, accelerator):
+    """Run full evaluation and return predictions/probabilities using Accelerator."""
+    model.eval()
     all_preds, all_targets, all_probs = [], [], []
 
     total_batches = len(test_loader)
     last_percent = -1
 
     for step, batch in enumerate(test_loader):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        shape_features = batch["shape_features"].to(device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
         labels = batch["labels"]
 
-        with autocast(enabled=(device.type == "cuda")):
+        with accelerator.autocast():
             logits = model(input_ids, attention_mask, shape_features)
         probs = torch.softmax(logits.float(), dim=1)
         _, preds = logits.max(1)
 
-        all_preds.extend(preds.cpu().numpy())
-        all_targets.extend(labels.numpy())
-        all_probs.extend(probs.cpu().numpy())
+        # Gather predictions, labels, and probabilities across all processes
+        preds_g, labels_g, probs_g = accelerator.gather_for_metrics((preds, labels, probs))
+
+        all_preds.extend(preds_g.cpu().numpy())
+        all_targets.extend(labels_g.cpu().numpy())
+        all_probs.extend(probs_g.cpu().numpy())
 
         # Update and print progress every 1% increment with a visual progress bar
         percent = int((step + 1) / total_batches * 100)
         if percent > last_percent:
-            bar_len = 20
-            filled_len = int(bar_len * percent / 100)
-            bar = "█" * filled_len + "░" * (bar_len - filled_len)
-            sys.stdout.write(f"\r  Evaluating: [{bar}] {percent}%   ")
-            sys.stdout.flush()
+            if accelerator.is_main_process:
+                bar_len = 20
+                filled_len = int(bar_len * percent / 100)
+                bar = "█" * filled_len + "░" * (bar_len - filled_len)
+                sys.stdout.write(f"\r  Evaluating: [{bar}] {percent}%   ")
+                sys.stdout.flush()
             last_percent = percent
 
     # Clear the temporary evaluation line
-    sys.stdout.write("\r" + " " * 80 + "\r")
-    sys.stdout.flush()
+    if accelerator.is_main_process:
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
     all_probs = np.array(all_probs)
 
-    print("\n" + "=" * 60)
-    print("CLASSIFICATION REPORT")
-    print("=" * 60)
-    report_str = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
-    print(report_str)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("CLASSIFICATION REPORT")
+        print("=" * 60)
+        report_str = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
+        print(report_str)
 
-    report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
-    with open(report_path, "w") as f:
-        f.write("CLASSIFICATION REPORT -- Cross-Modal Attention Dual-Branch\n")
-        f.write("=" * 60 + "\n")
-        f.write(report_str)
-    print(f"  -> Classification report saved to: {report_path}")
+        report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
+        with open(report_path, "w") as f:
+            f.write("CLASSIFICATION REPORT -- Cross-Modal Attention Dual-Branch\n")
+            f.write("=" * 60 + "\n")
+            f.write(report_str)
+        print(f"  -> Classification report saved to: {report_path}")
 
-    acc = accuracy_score(all_targets, all_preds)
-    f1_macro = f1_score(all_targets, all_preds, average="macro")
-    print(f"Overall Accuracy:  {acc:.4f}")
-    print(f"Macro F1-Score:    {f1_macro:.4f}")
+        acc = accuracy_score(all_targets, all_preds)
+        f1_macro = f1_score(all_targets, all_preds, average="macro")
+        print(f"Overall Accuracy:  {acc:.4f}")
+        print(f"Macro F1-Score:    {f1_macro:.4f}")
 
     return all_preds, all_targets, all_probs
 
 
-all_preds, all_targets, all_probs = full_evaluation(model, test_loader, cfg.CLASS_NAMES, DEVICE)
+all_preds, all_targets, all_probs = full_evaluation(model, test_loader, cfg.CLASS_NAMES, accelerator)
 
 # ── Post-processing: Export BED files for IGV Analysis ──
 def parse_header_to_bed(header):
@@ -1256,7 +1298,8 @@ def export_igv_bed_files(headers_test, predictions, targets, output_dir):
     print(f"    - True_SP4.bed: {len(true_sp4_coords)} lines")
     print(f"    - Confused_SP4_as_SP1.bed: {len(confused_sp4_as_sp1_coords)} lines")
 
-export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
+if accelerator.is_main_process:
+    export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 12: Generate All Performance Figures
@@ -1432,17 +1475,18 @@ def plot_per_class_metrics_bar(all_targets, all_preds, class_names, save_dir):
     print(f"  -> Per-class metrics: {path}")
 
 
-print("\n" + "=" * 60)
-print("GENERATING PERFORMANCE FIGURES")
-print("=" * 60)
+if accelerator.is_main_process:
+    print("\n" + "=" * 60)
+    print("GENERATING PERFORMANCE FIGURES")
+    print("=" * 60)
 
-plot_training_curves(history, cfg.FIG_DIR)
-plot_confusion_matrix(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_roc_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_precision_recall_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
-plot_per_class_metrics_bar(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_training_curves(history, cfg.FIG_DIR)
+    plot_confusion_matrix(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_roc_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_precision_recall_curves(all_targets, all_probs, cfg.CLASS_NAMES, cfg.FIG_DIR)
+    plot_per_class_metrics_bar(all_targets, all_preds, cfg.CLASS_NAMES, cfg.FIG_DIR)
 
-print("\nAll figures saved to:", cfg.FIG_DIR)
+    print("\nAll figures saved to:", cfg.FIG_DIR)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 13: Summary & Comparison
