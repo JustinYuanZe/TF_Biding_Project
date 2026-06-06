@@ -248,7 +248,7 @@ class Config:
     RANDOM_SEED = 42
 
     # ── Class Names ──
-    CLASS_NAMES = ["SP1", "SP2", "SP4", "Negative"]
+    CLASS_NAMES = ["Negative", "SP_Positive"]
 
     # ── DNAshape NPY files ──
     SHAPE_FILES = {
@@ -1073,7 +1073,7 @@ class TriBranchDataset(Dataset):
     """Dataset providing tokenized DNA sequences, DNAshape features, and sequence-derived bio-features."""
     def __init__(self, sequences, labels, shape_features, tokenizer, max_length=48):
         self.sequences = sequences
-        self.labels = [1 if l > 0 else 0 for l in labels]
+        self.labels = labels
         self.shape_features = shape_features
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -1118,6 +1118,10 @@ class TriBranchDataset(Dataset):
             "labels": torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
+
+# Convert multiclass labels SP1(0), SP2(1), SP4(2) -> Positive(1), and Negative(3) -> Negative(0)
+y_train = np.array([1 if l < 3 else 0 for l in y_train])
+y_test = np.array([1 if l < 3 else 0 for l in y_test])
 
 train_dataset = TriBranchDataset(seq_train, y_train, shape_train_norm, tokenizer, MAX_LENGTH)
 test_dataset = TriBranchDataset(seq_test, y_test, shape_test_norm, tokenizer, MAX_LENGTH)
@@ -1288,7 +1292,7 @@ def evaluate(model, loader, criterion, accelerator_obj):
             loss = criterion(logits, labels.float())
 
         # Gather predictions across GPUs for correct accuracy
-        preds = logits.argmax(dim=1)
+        preds = (logits > 0).long()
         preds, labels_gathered = accelerator_obj.gather_for_metrics((preds, labels))
         loss_gathered = accelerator_obj.gather_for_metrics(loss.repeat(labels.size(0)))
 
@@ -1416,8 +1420,8 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
         labels = batch["labels"]
         with accelerator_obj.autocast():
             logits = model(input_ids, attention_mask, shape_features, bio_features)
-        probs = torch.softmax(logits.float(), dim=1)
-        preds = logits.argmax(dim=1)
+        probs = torch.sigmoid(logits.float())
+        preds = (logits > 0).long()
 
         preds_g, labels_g, probs_g = accelerator_obj.gather_for_metrics((preds, labels, probs))
         all_preds.extend(preds_g.cpu().numpy())
@@ -1543,24 +1547,34 @@ def plot_confusion_matrix(all_targets, all_preds, class_names, save_dir):
 
 
 def plot_roc_curves(all_targets, all_probs, class_names, save_dir):
-    n_classes = len(class_names)
-    y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
     plt.figure(figsize=(9, 7))
-    fpr_dict, tpr_dict, auc_dict = {}, {}, {}
-    for i in range(n_classes):
-        fpr_dict[i], tpr_dict[i], _ = roc_curve(y_bin[:, i], all_probs[:, i])
-        auc_dict[i] = auc(fpr_dict[i], tpr_dict[i])
-        plt.plot(fpr_dict[i], tpr_dict[i], color=colors[i], linewidth=2,
-                 label=f"{class_names[i]} (AUC = {auc_dict[i]:.4f})")
-    all_fpr = np.unique(np.concatenate([fpr_dict[i] for i in range(n_classes)]))
-    mean_tpr = np.zeros_like(all_fpr)
-    for i in range(n_classes):
-        mean_tpr += np.interp(all_fpr, fpr_dict[i], tpr_dict[i])
-    mean_tpr /= n_classes
-    macro_auc = auc(all_fpr, mean_tpr)
-    plt.plot(all_fpr, mean_tpr, color="#9C27B0", linewidth=2.5, linestyle="--",
-             label=f"Macro Average (AUC = {macro_auc:.4f})")
+    all_targets = np.array(all_targets)
+    all_probs = np.array(all_probs)
+    
+    if len(class_names) == 2:
+        fpr, tpr, _ = roc_curve(all_targets, all_probs)
+        auc_val = auc(fpr, tpr)
+        plt.plot(fpr, tpr, color="#2196F3", linewidth=2.5,
+                 label=f"{class_names[1]} vs {class_names[0]} (AUC = {auc_val:.4f})")
+    else:
+        n_classes = len(class_names)
+        y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
+        colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+        fpr_dict, tpr_dict, auc_dict = {}, {}, {}
+        for i in range(n_classes):
+            fpr_dict[i], tpr_dict[i], _ = roc_curve(y_bin[:, i], all_probs[:, i])
+            auc_dict[i] = auc(fpr_dict[i], tpr_dict[i])
+            plt.plot(fpr_dict[i], tpr_dict[i], color=colors[i], linewidth=2,
+                     label=f"{class_names[i]} (AUC = {auc_dict[i]:.4f})")
+        all_fpr = np.unique(np.concatenate([fpr_dict[i] for i in range(n_classes)]))
+        mean_tpr = np.zeros_like(all_fpr)
+        for i in range(n_classes):
+            mean_tpr += np.interp(all_fpr, fpr_dict[i], tpr_dict[i])
+        mean_tpr /= n_classes
+        macro_auc = auc(all_fpr, mean_tpr)
+        plt.plot(all_fpr, mean_tpr, color="#9C27B0", linewidth=2.5, linestyle="--",
+                 label=f"Macro Average (AUC = {macro_auc:.4f})")
+                 
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4, label="Random Guess (0.50)")
     plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
     plt.xlabel("False Positive Rate", fontsize=12); plt.ylabel("True Positive Rate", fontsize=12)
@@ -1573,16 +1587,28 @@ def plot_roc_curves(all_targets, all_probs, class_names, save_dir):
 
 
 def plot_precision_recall_curves(all_targets, all_probs, class_names, save_dir):
-    n_classes = len(class_names)
-    y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
     plt.figure(figsize=(9, 7))
-    for i in range(n_classes):
-        precision, recall, _ = precision_recall_curve(y_bin[:, i], all_probs[:, i])
-        ap = average_precision_score(y_bin[:, i], all_probs[:, i])
-        plt.plot(recall, precision, color=colors[i], linewidth=2,
-                 label=f"{class_names[i]} (AP = {ap:.4f})")
-    plt.axhline(y=0.25, color="gray", linestyle="--", alpha=0.5, label="Random Baseline")
+    all_targets = np.array(all_targets)
+    all_probs = np.array(all_probs)
+    
+    if len(class_names) == 2:
+        precision, recall, _ = precision_recall_curve(all_targets, all_probs)
+        ap = average_precision_score(all_targets, all_probs)
+        plt.plot(recall, precision, color="#2196F3", linewidth=2.5,
+                 label=f"{class_names[1]} vs {class_names[0]} (AP = {ap:.4f})")
+        pos_ratio = np.sum(all_targets == 1) / len(all_targets) if len(all_targets) > 0 else 0.5
+        plt.axhline(y=pos_ratio, color="gray", linestyle="--", alpha=0.5, label=f"Random Baseline ({pos_ratio:.2f})")
+    else:
+        n_classes = len(class_names)
+        y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
+        colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+        for i in range(n_classes):
+            precision, recall, _ = precision_recall_curve(y_bin[:, i], all_probs[:, i])
+            ap = average_precision_score(y_bin[:, i], all_probs[:, i])
+            plt.plot(recall, precision, color=colors[i], linewidth=2,
+                     label=f"{class_names[i]} (AP = {ap:.4f})")
+        plt.axhline(y=0.25, color="gray", linestyle="--", alpha=0.5, label="Random Baseline")
+        
     plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
     plt.xlabel("Recall", fontsize=12); plt.ylabel("Precision", fontsize=12)
     plt.title(f"Precision-Recall Curves -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
@@ -1687,10 +1713,11 @@ if accelerator.is_main_process:
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
                 shape_features = batch["shape_features"].to(device)
+                bio_features = batch["bio_features"].to(device)
                 labels = batch["labels"].to(device)
                 
-                logits = model(input_ids, attention_mask, shape_features)
-                preds = logits.argmax(dim=1)
+                logits = model(input_ids, attention_mask, shape_features, bio_features)
+                preds = (logits > 0).long()
                 
                 all_preds.extend(preds.cpu().numpy())
                 all_targets.extend(labels.cpu().numpy())
@@ -1699,18 +1726,18 @@ if accelerator.is_main_process:
         all_targets = np.array(all_targets)
         
         # Filter indices for Subset A and Subset B
-        # Class index 2 represents "SP4"
-        sp4_class_idx = 2
+        # Class index 1 represents "SP_Positive"
+        sp_pos_class_idx = 1
         
-        subset_A_indices = []  # Correct SP4 predictions
-        subset_B_indices = []  # Confused SP4 (predicted as SP1 or SP2)
+        subset_A_indices = []  # Correct Positive predictions
+        subset_B_indices = []  # False Negatives
         
         for idx in range(len(all_targets)):
-            if all_targets[idx] == sp4_class_idx:
+            if all_targets[idx] == sp_pos_class_idx:
                 pred = all_preds[idx]
-                if pred == sp4_class_idx:
+                if pred == sp_pos_class_idx:
                     subset_A_indices.append(idx)
-                elif pred in [0, 1]:  # SP1 (0) or SP2 (1)
+                elif pred == 0:  # Predicted as Negative
                     subset_B_indices.append(idx)
                     
         print(f"  Subset A (Correct SP4): {len(subset_A_indices)} samples")
@@ -1762,7 +1789,9 @@ if accelerator.is_main_process:
                     seq_pooled = self.gcmab_model.seq_mscnn(seq_in)
                     shape_pooled = self.gcmab_model.shape_mscnn(shape_in)
                     
-                    fused = torch.cat([seq_pooled, shape_pooled], dim=1)
+                    bio_dummy = torch.zeros(seq_embeddings.shape[0], 3, device=seq_embeddings.device)
+                    bio_out = self.gcmab_model.bio_branch(bio_dummy)
+                    fused = torch.cat([seq_pooled, shape_pooled, bio_out], dim=1)
                     logits = self.gcmab_model.classifier(fused)
                     return logits
                     
@@ -1793,28 +1822,11 @@ if accelerator.is_main_process:
             shap_values_A = explainer.shap_values([test_A_embeddings, test_A_shapes])
             shap_values_B = explainer.shap_values([test_B_embeddings, test_B_shapes])
             
-            # Extract SHAP values for target class SP4 (index 2) dynamically
-            if isinstance(shap_values_A, list) and len(shap_values_A) == 2:
-                seq_shap_A = shap_values_A[0]
-                shape_shap_A = shap_values_A[1]
-                if seq_shap_A.ndim > 3:
-                    seq_shap_A = seq_shap_A[..., sp4_class_idx]
-                if shape_shap_A.ndim > 3:
-                    shape_shap_A = shape_shap_A[..., sp4_class_idx]
-            else:
-                seq_shap_A = shap_values_A[sp4_class_idx][0]
-                shape_shap_A = shap_values_A[sp4_class_idx][1]
-                
-            if isinstance(shap_values_B, list) and len(shap_values_B) == 2:
-                seq_shap_B = shap_values_B[0]
-                shape_shap_B = shap_values_B[1]
-                if seq_shap_B.ndim > 3:
-                    seq_shap_B = seq_shap_B[..., sp4_class_idx]
-                if shape_shap_B.ndim > 3:
-                    shape_shap_B = shape_shap_B[..., sp4_class_idx]
-            else:
-                seq_shap_B = shap_values_B[sp4_class_idx][0]
-                shape_shap_B = shap_values_B[sp4_class_idx][1]
+            # Extract SHAP values for binary classification (explainer outputs [seq, shape] directly)
+            seq_shap_A = shap_values_A[0]
+            shape_shap_A = shap_values_A[1]
+            seq_shap_B = shap_values_B[0]
+            shape_shap_B = shap_values_B[1]
             
             # ──────────────────────────────────────────────────────────
             # Goal A: DNAshape Feature Importance Bar Chart
