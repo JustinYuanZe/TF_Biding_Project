@@ -1180,15 +1180,10 @@ scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 # Class weights for CrossEntropy Loss
 class_counts = np.bincount(y_train)
 class_weights = len(y_train) / (len(class_counts) * class_counts.astype(np.float32))
-
-# --- MANUAL WEIGHT ADJUSTMENT (SIMULATE 1:1 NEGATIVE vs ALL POSITIVE) ---
-# Multiply Negative class weight (index 0) by 3.0 so it has the same total weight as SP1+SP2+SP4
-class_weights[0] *= 3.0
-
 class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=accelerator.device)
 
 if accelerator.is_main_process:
-    print(f"  Class weights (Adjusted): " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(len(class_counts))]))
+    print(f"  Class weights: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(len(class_counts))]))
 
 criterion = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=cfg.LABEL_SMOOTHING)
 
