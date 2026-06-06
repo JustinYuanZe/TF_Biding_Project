@@ -1254,7 +1254,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
             optimizer.zero_grad()
 
         running_loss += loss.item() * labels.size(0)
-        _, predicted = logits.max(1)
+        predicted = (logits > 0).long()
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         if accelerator_obj.is_main_process:
