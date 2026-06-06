@@ -952,7 +952,7 @@ class TriBranchGCMABmsCNNClassifier(nn.Module):
             nn.Linear(in_features, cfg.HIDDEN_DIM),
             nn.GELU(),
             nn.Dropout(cfg.FUSION_DROPOUT),
-            nn.Linear(cfg.HIDDEN_DIM, cfg.NUM_CLASSES)
+            nn.Linear(cfg.HIDDEN_DIM, 1)
         )
 
     def _get_bert_features(self, input_ids, attention_mask):
@@ -1443,9 +1443,9 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
         print(f"  -> Report saved: {report_path}")
 
         acc = accuracy_score(all_targets, all_preds)
-        f1_macro = f1_score(all_targets, all_preds, average="macro")
+        f1_macro = f1_score(all_targets, all_preds, average="binary")
         print(f"Overall Accuracy:  {acc:.4f}")
-        print(f"Macro F1-Score:    {f1_macro:.4f}")
+        print(f"Binary F1-Score:    {f1_macro:.4f}")
 
     return all_preds, all_targets, all_probs
 
