@@ -100,6 +100,7 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 from transformers import AutoTokenizer, AutoModel, AutoConfig
+from tqdm import tqdm
 
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
