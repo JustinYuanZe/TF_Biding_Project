@@ -711,112 +711,127 @@ print(f"  Label smoothing:           {cfg.LABEL_SMOOTHING}")
 # CELL 9: Training Loop with Gradient Accumulation & Early Stopping
 # ═══════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, criterion, device):
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_obj,
+                    grad_accum_steps, max_grad_norm=1.0, epoch_num=0):
     """Train for one epoch with gradient accumulation."""
     model.train()
-    train_loss_sum, train_total = 0.0, 0
-    all_train_preds, all_train_targets = [], []
+    running_loss = 0.0
+    correct = 0
+    total = 0
 
-    for step, batch in enumerate(train_loader):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
+    grad_norms = []
 
-        with accelerator.accumulate(model):
-            with accelerator.autocast():
+    pbar = tqdm(loader, desc="  Training", leave=False, disable=not accelerator_obj.is_main_process)
+    for step, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(accelerator_obj.device)
+        attention_mask = batch["attention_mask"].to(accelerator_obj.device)
+        labels = batch["labels"].to(accelerator_obj.device)
+
+        with accelerator_obj.accumulate(model):
+            with accelerator_obj.autocast():
                 logits = model(input_ids, attention_mask)
                 loss = criterion(logits, labels.float())
 
-            accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            accelerator_obj.backward(loss)
+
+            if accelerator_obj.sync_gradients:
+                total_norm = accelerator_obj.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                if isinstance(total_norm, torch.Tensor):
+                    grad_norms.append(total_norm.item())
+                else:
+                    grad_norms.append(float(total_norm))
+
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        # Gather metrics
+        running_loss += loss.item() * labels.size(0)
         predicted = (logits > 0).long()
-        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
-        loss_gathered = accelerator.gather(loss).mean().item()
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        if accelerator_obj.is_main_process:
+            pbar.set_postfix({"loss": f"{running_loss/total:.4f}", "acc": f"{correct/total:.4f}"})
 
-        train_loss_sum += loss_gathered * targets_gathered.size(0)
-        train_total += targets_gathered.size(0)
-        all_train_preds.extend(preds_gathered.cpu().numpy())
-        all_train_targets.extend(targets_gathered.cpu().numpy())
+    # Print gradient diagnostics for first few epochs
+    if epoch_num < 5 and grad_norms and accelerator_obj.is_main_process:
+        avg_norm = np.mean(grad_norms)
+        max_norm_val = np.max(grad_norms)
+        print(f"  [Grad Monitor] avg_norm={avg_norm:.4f}, max_norm={max_norm_val:.4f}, steps={len(grad_norms)}")
+        if avg_norm < 1e-6 or np.isnan(avg_norm):
+            print("  ⚠️  WARNING: Gradients near zero or NaN! Model training might be unstable.")
 
-    train_loss = train_loss_sum / train_total
-    train_acc = accuracy_score(all_train_targets, all_train_preds)
-    return train_loss, train_acc
+    return running_loss / max(total, 1), correct / max(total, 1)
 
 
 @torch.no_grad()
-def evaluate(model, test_loader, criterion, device):
+def evaluate(model, loader, criterion, accelerator_obj):
     """Evaluate on validation/test set."""
     model.eval()
-    val_loss_sum, val_total = 0.0, 0
-    all_val_preds, all_val_targets = [], []
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    for batch in loader:
+        input_ids = batch["input_ids"].to(accelerator_obj.device)
+        attention_mask = batch["attention_mask"].to(accelerator_obj.device)
+        labels = batch["labels"].to(accelerator_obj.device)
 
-    for batch in test_loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-
-        with accelerator.autocast():
+        with accelerator_obj.autocast():
             logits = model(input_ids, attention_mask)
             loss = criterion(logits, labels.float())
 
-        # Gather metrics
-        predicted = (logits > 0).long()
-        preds_gathered, targets_gathered = accelerator.gather_for_metrics((predicted, labels))
-        loss_gathered = accelerator.gather(loss).mean().item()
+        # Gather predictions across GPUs for correct accuracy
+        preds = (logits > 0).long()
+        preds, labels_gathered = accelerator_obj.gather_for_metrics((preds, labels))
+        loss_gathered = accelerator_obj.gather_for_metrics(loss.repeat(labels.size(0)))
 
-        val_loss_sum += loss_gathered * targets_gathered.size(0)
-        val_total += targets_gathered.size(0)
-        all_val_preds.extend(preds_gathered.cpu().numpy())
-        all_val_targets.extend(targets_gathered.cpu().numpy())
+        running_loss += loss_gathered.sum().item()
+        total += labels_gathered.size(0)
+        correct += preds.eq(labels_gathered).sum().item()
 
-    val_loss = val_loss_sum / val_total
-    val_acc = accuracy_score(all_val_targets, all_val_preds)
-    return val_loss, val_acc
+    return running_loss / max(total, 1), correct / max(total, 1)
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, cfg, device):
-    """Full training loop with early stopping."""
-    print("\n" + "=" * 60)
-    print("TRAINING — End-to-End Fine-Tuning")
-    print("=" * 60)
+                criterion, accelerator_obj, cfg):
+    if accelerator_obj.is_main_process:
+        print("\n" + "=" * 60)
+        print("TRAINING — End-to-End Fine-Tuning")
+        print("=" * 60)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-    best_val_loss = float("inf")
     best_val_acc = 0.0
+    best_val_loss = float("inf")
     patience_counter = 0
 
     for epoch in range(cfg.EPOCHS):
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion, device
+            model, train_loader, optimizer, scheduler, criterion, accelerator_obj,
+            cfg.GRAD_ACCUM_STEPS, max_grad_norm=cfg.MAX_GRAD_NORM, epoch_num=epoch,
         )
 
-        val_loss, val_acc = evaluate(model, test_loader, criterion, device)
+        val_loss, val_acc = evaluate(model, test_loader, criterion, accelerator_obj)
 
         elapsed = time.time() - t0
+        gap = train_acc - val_acc
 
-                # Synchronize training metrics across all processes for consistent logging and stopping decisions
-        train_loss_tensor = torch.tensor(train_loss, device=accelerator.device)
-        train_acc_tensor = torch.tensor(train_acc, device=accelerator.device)
-        train_loss = accelerator.gather(train_loss_tensor).mean().item()
-        train_acc = accelerator.gather(train_acc_tensor).mean().item()
+        # Synchronize training metrics across all processes for consistent logging and stopping decisions
+        train_loss_tensor = torch.tensor(train_loss, device=accelerator_obj.device)
+        train_acc_tensor = torch.tensor(train_acc, device=accelerator_obj.device)
+        train_loss = accelerator_obj.gather(train_loss_tensor).mean().item()
+        train_acc = accelerator_obj.gather(train_acc_tensor).mean().item()
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
+        # Synchronize before printing and saving checkpoint
+        accelerator_obj.wait_for_everyone()
+
         backbone_lr = optimizer.param_groups[0]["lr"]
         gap_percent = (train_acc - val_acc) * 100
-
         print(
             f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
             f"Train: {train_loss:.4f}/{train_acc:.4f} | "
@@ -829,36 +844,42 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             print(f"\n  ⏹ Early stopping at epoch {epoch+1} due to severe overfitting (Gap: {gap_percent:+.2f}% >= {cfg.MAX_OVERFITTING_GAP}%)")
             break
 
-        # Checkpoint based on val_acc (using the requested val_acc-based early stopping logic)
-        accelerator.wait_for_everyone()
+        if epoch >= 3 and max(history["val_acc"]) < 0.30:
+            print("  ⚠️  WARNING: Val accuracy still near random chance after 3 epochs!")
+
         if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
-            ckpt_path = os.path.join(cfg.MODEL_DIR, "best_dnabert2_finetune.pt")
-            if accelerator.is_main_process:
-                unwrapped = accelerator.unwrap_model(model)
+            
+            # Save checkpoint only on the main process
+            if accelerator_obj.is_main_process:
+                unwrapped = accelerator_obj.unwrap_model(model)
+                ckpt_path = os.path.join(cfg.MODEL_DIR, "best_dnabert2_finetune.pt")
                 torch.save({
                     "epoch": epoch + 1,
                     "model_state_dict": unwrapped.state_dict(),
                     "val_loss": val_loss,
                     "val_acc": val_acc,
                 }, ckpt_path)
-                print(f"  → Saved best model (val_acc={val_acc:.4f})")
+                print(f"  → Saved best model (val_loss={val_loss:.4f}, val_acc={val_acc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= cfg.PATIENCE:
-                print(f"\n  ⏹ Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
+                print(f"\n  Early stopping at epoch {epoch+1} (patience={cfg.PATIENCE})")
                 break
-        accelerator.wait_for_everyone()
 
-    print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
+        # Synchronize after checkpoint operations
+        accelerator_obj.wait_for_everyone()
+
+    if accelerator_obj.is_main_process:
+        print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
 history = train_model(
     model, train_loader, test_loader, optimizer, scheduler,
-    criterion, cfg, DEVICE,
+    criterion, accelerator, cfg
 )
 
 # ═══════════════════════════════════════════════════════════════════════

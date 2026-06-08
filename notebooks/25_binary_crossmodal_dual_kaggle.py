@@ -1008,100 +1008,94 @@ print(f"    Late Pooling:   MeanPool AFTER cross-attention (not before)")
 # CELL 10: Training Loop with Gradient Accumulation & Early Stopping
 # ═══════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, criterion,
-                    accelerator, grad_accum_steps):
-    """Train for one epoch with gradient accumulation and clean 1% progress logging using Accelerator."""
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_obj,
+                    grad_accum_steps, max_grad_norm=1.0, epoch_num=0):
+    """Train for one epoch with gradient accumulation."""
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
-    optimizer.zero_grad()
 
-    total_steps = len(train_loader)
-    last_percent = -1
+    grad_norms = []
 
-    for step, batch in enumerate(train_loader):
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        shape_features = batch["shape_features"]
-        labels = batch["labels"]
+    pbar = tqdm(loader, desc="  Training", leave=False, disable=not accelerator_obj.is_main_process)
+    for step, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(accelerator_obj.device)
+        attention_mask = batch["attention_mask"].to(accelerator_obj.device)
+        shape_features = batch["shape_features"].to(accelerator_obj.device)
+        labels = batch["labels"].to(accelerator_obj.device)
 
-        with accelerator.accumulate(model):
-            with accelerator.autocast():
+        with accelerator_obj.accumulate(model):
+            with accelerator_obj.autocast():
                 logits = model(input_ids, attention_mask, shape_features)
                 loss = criterion(logits, labels.float())
 
-            accelerator.backward(loss)
+            accelerator_obj.backward(loss)
 
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if accelerator_obj.sync_gradients:
+                total_norm = accelerator_obj.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                if isinstance(total_norm, torch.Tensor):
+                    grad_norms.append(total_norm.item())
+                else:
+                    grad_norms.append(float(total_norm))
 
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        # Update training metrics locally (not gathered to save communication overhead, identical to Script 20)
         running_loss += loss.item() * labels.size(0)
         predicted = (logits > 0).long()
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+        if accelerator_obj.is_main_process:
+            pbar.set_postfix({"loss": f"{running_loss/total:.4f}", "acc": f"{correct/total:.4f}"})
 
-        # Update and print progress every 1% increment with a visual progress bar (only on main process)
-        percent = int((step + 1) / total_steps * 100)
-        if percent > last_percent:
-            if accelerator.is_main_process:
-                bar_len = 20
-                filled_len = int(bar_len * percent / 100)
-                bar = "█" * filled_len + "░" * (bar_len - filled_len)
-                sys.stdout.write(f"\r  Training: [{bar}] {percent}% | Loss: {running_loss/total:.4f} | Acc: {correct/total:.4f}   ")
-                sys.stdout.flush()
-            last_percent = percent
-
-    # Clear the temporary training line
-    if accelerator.is_main_process:
-        sys.stdout.write("\r" + " " * 80 + "\r")
-        sys.stdout.flush()
+    # Print gradient diagnostics for first few epochs
+    if epoch_num < 5 and grad_norms and accelerator_obj.is_main_process:
+        avg_norm = np.mean(grad_norms)
+        max_norm_val = np.max(grad_norms)
+        print(f"  [Grad Monitor] avg_norm={avg_norm:.4f}, max_norm={max_norm_val:.4f}, steps={len(grad_norms)}")
+        if avg_norm < 1e-6 or np.isnan(avg_norm):
+            print("  ⚠️  WARNING: Gradients near zero or NaN! Model training might be unstable.")
 
     return running_loss / max(total, 1), correct / max(total, 1)
 
 
 @torch.no_grad()
-def evaluate(model, test_loader, criterion, accelerator):
-    """Evaluate on validation/test set using Accelerator to gather metrics."""
+def evaluate(model, loader, criterion, accelerator_obj):
+    """Evaluate on validation/test set."""
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
+    for batch in loader:
+        input_ids = batch["input_ids"].to(accelerator_obj.device)
+        attention_mask = batch["attention_mask"].to(accelerator_obj.device)
+        shape_features = batch["shape_features"].to(accelerator_obj.device)
+        labels = batch["labels"].to(accelerator_obj.device)
 
-    for batch in test_loader:
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        shape_features = batch["shape_features"]
-        labels = batch["labels"]
-
-        with accelerator.autocast():
+        with accelerator_obj.autocast():
             logits = model(input_ids, attention_mask, shape_features)
             loss = criterion(logits, labels.float())
 
-        predicted = (logits > 0).long()
-
-        # Gather predictions, labels, and losses across all processes
-        predicted, labels_gathered = accelerator.gather_for_metrics((predicted, labels))
-        loss_gathered = accelerator.gather_for_metrics(loss.repeat(labels.size(0)))
+        # Gather predictions across GPUs for correct accuracy
+        preds = (logits > 0).long()
+        preds, labels_gathered = accelerator_obj.gather_for_metrics((preds, labels))
+        loss_gathered = accelerator_obj.gather_for_metrics(loss.repeat(labels.size(0)))
 
         running_loss += loss_gathered.sum().item()
         total += labels_gathered.size(0)
-        correct += predicted.eq(labels_gathered).sum().item()
+        correct += preds.eq(labels_gathered).sum().item()
 
     return running_loss / max(total, 1), correct / max(total, 1)
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler,
-                criterion, accelerator, cfg):
-    """Full training loop with early stopping on val_acc."""
-    print("\n" + "=" * 60)
-    print("TRAINING -- Cross-Modal Attention Dual-Branch")
-    print("=" * 60)
+                criterion, accelerator_obj, cfg):
+    if accelerator_obj.is_main_process:
+        print("\n" + "=" * 60)
+        print("TRAINING -- Cross-Modal Attention Dual-Branch")
+        print("=" * 60)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_val_acc = 0.0
@@ -1112,19 +1106,20 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion,
-            accelerator, cfg.GRAD_ACCUM_STEPS,
+            model, train_loader, optimizer, scheduler, criterion, accelerator_obj,
+            cfg.GRAD_ACCUM_STEPS, max_grad_norm=cfg.MAX_GRAD_NORM, epoch_num=epoch,
         )
 
-        val_loss, val_acc = evaluate(model, test_loader, criterion, accelerator)
+        val_loss, val_acc = evaluate(model, test_loader, criterion, accelerator_obj)
 
         elapsed = time.time() - t0
+        gap = train_acc - val_acc
 
-                # Synchronize training metrics across all processes for consistent logging and stopping decisions
-        train_loss_tensor = torch.tensor(train_loss, device=accelerator.device)
-        train_acc_tensor = torch.tensor(train_acc, device=accelerator.device)
-        train_loss = accelerator.gather(train_loss_tensor).mean().item()
-        train_acc = accelerator.gather(train_acc_tensor).mean().item()
+        # Synchronize training metrics across all processes for consistent logging and stopping decisions
+        train_loss_tensor = torch.tensor(train_loss, device=accelerator_obj.device)
+        train_acc_tensor = torch.tensor(train_acc, device=accelerator_obj.device)
+        train_loss = accelerator_obj.gather(train_loss_tensor).mean().item()
+        train_acc = accelerator_obj.gather(train_acc_tensor).mean().item()
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
@@ -1132,12 +1127,9 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         history["val_acc"].append(val_acc)
 
         # Synchronize before printing and saving checkpoint
-        accelerator.wait_for_everyone()
+        accelerator_obj.wait_for_everyone()
 
         backbone_lr = optimizer.param_groups[0]["lr"]
-        cross_lr = optimizer.param_groups[3]["lr"]
-        head_lr = optimizer.param_groups[4]["lr"]
-
         gap_percent = (train_acc - val_acc) * 100
         print(
             f"Epoch {epoch+1:02d}/{cfg.EPOCHS} | "
@@ -1157,12 +1149,12 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
             patience_counter = 0
             
             # Save checkpoint only on the main process
-            if accelerator.is_main_process:
-                unwrapped_model = accelerator.unwrap_model(model)
+            if accelerator_obj.is_main_process:
+                unwrapped = accelerator_obj.unwrap_model(model)
                 ckpt_path = os.path.join(cfg.MODEL_DIR, "best_binary_crossmodal_dual.pt")
                 torch.save({
                     "epoch": epoch + 1,
-                    "model_state_dict": unwrapped_model.state_dict(),
+                    "model_state_dict": unwrapped.state_dict(),
                     "val_loss": val_loss,
                     "val_acc": val_acc,
                 }, ckpt_path)
@@ -1174,17 +1166,16 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                 break
 
         # Synchronize after checkpoint operations
-        accelerator.wait_for_everyone()
+        accelerator_obj.wait_for_everyone()
 
-    print(f"\nTraining complete.")
-    print(f"  Best val_loss: {best_val_loss:.4f}")
-    print(f"  Best val_acc:  {best_val_acc:.4f}")
+    if accelerator_obj.is_main_process:
+        print(f"\nTraining complete. Best val_acc: {best_val_acc:.4f}")
     return history
 
 
 history = train_model(
     model, train_loader, test_loader, optimizer, scheduler,
-    criterion, accelerator, cfg,
+    criterion, accelerator, cfg
 )
 
 # ═══════════════════════════════════════════════════════════════════════
