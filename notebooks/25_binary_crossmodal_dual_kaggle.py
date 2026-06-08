@@ -212,6 +212,7 @@ class Config:
     PATIENCE = 10
     MAX_OVERFITTING_GAP = 30.0  # Max train-val gap (%) to prevent severe overfitting
     WARMUP_RATIO = 0.1
+    MAX_GRAD_NORM = 1.0
 
     # ── Data Split ──
     TEST_SIZE = 0.2

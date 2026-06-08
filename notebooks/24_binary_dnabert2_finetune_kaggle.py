@@ -171,6 +171,7 @@ class Config:
     PATIENCE = 5                  # Early stopping patience
     MAX_OVERFITTING_GAP = 30.0  # Max train-val gap (%) to prevent severe overfitting
     WARMUP_RATIO = 0.1            # 10% of total steps for warmup
+    MAX_GRAD_NORM = 1.0
 
     # ── Data Split ──
     TEST_SIZE = 0.2
