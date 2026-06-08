@@ -678,16 +678,15 @@ def lr_lambda(current_step):
 
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-# Compute class weights for 4-class classification imbalance (SP1, SP2, SP4, Negative)
-class_counts = np.bincount(y_train)
-total_count = len(y_train)
-num_classes = len(class_counts)
+# Pos weight for BCEWithLogitsLoss
+y_train_arr = np.array(y_train)
+pos_count = np.sum(y_train_arr == 1)
+neg_count = np.sum(y_train_arr == 0)
+pos_weight_val = float(neg_count) / float(pos_count) if pos_count > 0 else 1.0
+pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32, device=DEVICE)
+print(f"  BCE pos_weight: {pos_weight_val:.4f} (Negative: {neg_count}, Positive: {pos_count})")
 
-class_weights = total_count / (num_classes * class_counts.astype(np.float32))
-class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
-print(f"  [Auto-detect] Class weights for loss function: " + ", ".join([f"{cfg.CLASS_NAMES[i]}={class_weights[i]:.4f}" for i in range(num_classes)]))
-
-criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.LABEL_SMOOTHING)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, test_loader, scheduler
@@ -889,7 +888,7 @@ def full_evaluation(model, test_loader, class_names, device):
         with accelerator.autocast():
             logits = model(input_ids, attention_mask)
         probs = torch.sigmoid(logits.float())
-        _, preds = logits.max(1)
+        preds = (logits > 0).long()
 
         # Gather metrics across GPUs
         preds_gathered, targets_gathered = accelerator.gather_for_metrics((preds, labels))
@@ -909,7 +908,7 @@ def full_evaluation(model, test_loader, class_names, device):
     print(classification_report(all_targets, all_preds, target_names=class_names, digits=4))
 
     acc = accuracy_score(all_targets, all_preds)
-    f1_macro = f1_score(all_targets, all_preds, average="macro")
+    f1_macro = f1_score(all_targets, all_preds, average="binary")
     print(f"Overall Accuracy:  {acc:.4f}")
     print(f"Macro F1-Score:    {f1_macro:.4f}")
 
@@ -996,28 +995,34 @@ def plot_confusion_matrix(all_targets, all_preds, class_names, save_dir):
 
 
 def plot_roc_curves(all_targets, all_probs, class_names, save_dir):
-    """Plot per-class and macro-average ROC curves."""
-    n_classes = len(class_names)
-    y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
-
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+    """Plot ROC curves."""
     plt.figure(figsize=(9, 7))
-
-    fpr_dict, tpr_dict, auc_dict = {}, {}, {}
-    for i in range(n_classes):
-        fpr_dict[i], tpr_dict[i], _ = roc_curve(y_bin[:, i], all_probs[:, i])
-        auc_dict[i] = auc(fpr_dict[i], tpr_dict[i])
-        plt.plot(fpr_dict[i], tpr_dict[i], color=colors[i], linewidth=2,
-                 label=f"{class_names[i]} (AUC = {auc_dict[i]:.4f})")
-
-    all_fpr = np.unique(np.concatenate([fpr_dict[i] for i in range(n_classes)]))
-    mean_tpr = np.zeros_like(all_fpr)
-    for i in range(n_classes):
-        mean_tpr += np.interp(all_fpr, fpr_dict[i], tpr_dict[i])
-    mean_tpr /= n_classes
-    macro_auc = auc(all_fpr, mean_tpr)
-    plt.plot(all_fpr, mean_tpr, color="#9C27B0", linewidth=2.5, linestyle="--",
-             label=f"Macro Average (AUC = {macro_auc:.4f})")
+    all_targets = np.array(all_targets)
+    all_probs = np.array(all_probs)
+    
+    if len(class_names) == 2:
+        fpr, tpr, _ = roc_curve(all_targets, all_probs)
+        auc_val = auc(fpr, tpr)
+        plt.plot(fpr, tpr, color="#2196F3", linewidth=2.5,
+                 label=f"{class_names[1]} vs {class_names[0]} (AUC = {auc_val:.4f})")
+    else:
+        n_classes = len(class_names)
+        y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
+        colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+        fpr_dict, tpr_dict, auc_dict = {}, {}, {}
+        for i in range(n_classes):
+            fpr_dict[i], tpr_dict[i], _ = roc_curve(y_bin[:, i], all_probs[:, i])
+            auc_dict[i] = auc(fpr_dict[i], tpr_dict[i])
+            plt.plot(fpr_dict[i], tpr_dict[i], color=colors[i], linewidth=2,
+                     label=f"{class_names[i]} (AUC = {auc_dict[i]:.4f})")
+        all_fpr = np.unique(np.concatenate([fpr_dict[i] for i in range(n_classes)]))
+        mean_tpr = np.zeros_like(all_fpr)
+        for i in range(n_classes):
+            mean_tpr += np.interp(all_fpr, fpr_dict[i], tpr_dict[i])
+        mean_tpr /= n_classes
+        macro_auc = auc(all_fpr, mean_tpr)
+        plt.plot(all_fpr, mean_tpr, color="#9C27B0", linewidth=2.5, linestyle="--",
+                 label=f"Macro Average (AUC = {macro_auc:.4f})")
 
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4, label="Random Guess (0.50)")
     plt.xlim([0.0, 1.0])
@@ -1035,19 +1040,29 @@ def plot_roc_curves(all_targets, all_probs, class_names, save_dir):
 
 
 def plot_precision_recall_curves(all_targets, all_probs, class_names, save_dir):
-    """Plot per-class Precision-Recall curves."""
-    n_classes = len(class_names)
-    y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
-
+    """Plot Precision-Recall curves."""
     plt.figure(figsize=(9, 7))
-    for i in range(n_classes):
-        precision, recall, _ = precision_recall_curve(y_bin[:, i], all_probs[:, i])
-        ap = average_precision_score(y_bin[:, i], all_probs[:, i])
-        plt.plot(recall, precision, color=colors[i], linewidth=2,
-                 label=f"{class_names[i]} (AP = {ap:.4f})")
-
-    plt.axhline(y=0.25, color="gray", linestyle="--", alpha=0.5, label="Random Baseline")
+    all_targets = np.array(all_targets)
+    all_probs = np.array(all_probs)
+    
+    if len(class_names) == 2:
+        precision, recall, _ = precision_recall_curve(all_targets, all_probs)
+        ap = average_precision_score(all_targets, all_probs)
+        plt.plot(recall, precision, color="#2196F3", linewidth=2.5,
+                 label=f"{class_names[1]} vs {class_names[0]} (AP = {ap:.4f})")
+        pos_ratio = np.sum(all_targets == 1) / len(all_targets) if len(all_targets) > 0 else 0.5
+        plt.axhline(y=pos_ratio, color="gray", linestyle="--", alpha=0.5, label=f"Random Baseline ({pos_ratio:.2f})")
+    else:
+        n_classes = len(class_names)
+        y_bin = label_binarize(all_targets, classes=list(range(n_classes)))
+        colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+        for i in range(n_classes):
+            precision, recall, _ = precision_recall_curve(y_bin[:, i], all_probs[:, i])
+            ap = average_precision_score(y_bin[:, i], all_probs[:, i])
+            plt.plot(recall, precision, color=colors[i], linewidth=2,
+                     label=f"{class_names[i]} (AP = {ap:.4f})")
+        plt.axhline(y=0.25, color="gray", linestyle="--", alpha=0.5, label="Random Baseline")
+        
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
     plt.xlabel("Recall", fontsize=12)
