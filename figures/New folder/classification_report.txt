@@ -1,0 +1,12 @@
+CLASSIFICATION REPORT -- Cross-Modal Attention Dual-Branch
+============================================================
+              precision    recall  f1-score   support
+
+         SP1     0.5546    0.6226    0.5866       726
+         SP2     0.5697    0.4835    0.5231       668
+         SP4     0.4387    0.4858    0.4611       634
+    Negative     0.9249    0.8490    0.8853       682
+
+    accuracy                         0.6133      2710
+   macro avg     0.6220    0.6102    0.6140      2710
+weighted avg     0.6244    0.6133    0.6168      2710

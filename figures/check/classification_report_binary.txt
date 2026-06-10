@@ -1,0 +1,13 @@
+CLASSIFICATION REPORT — Binary Sanity Check
+============================================================
+Positive = SP1 + SP2 + SP4 (merged)
+Negative = Negative
+
+              precision    recall  f1-score   support
+
+    Negative     0.5532    0.4648    0.5052       682
+    Positive     0.8292    0.8738    0.8509      2028
+
+    accuracy                         0.7708      2710
+   macro avg     0.6912    0.6693    0.6780      2710
+weighted avg     0.7597    0.7708    0.7639      2710

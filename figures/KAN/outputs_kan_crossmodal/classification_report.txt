@@ -1,0 +1,12 @@
+CLASSIFICATION REPORT -- KAN-Regularized Cross-Modal Attention
+============================================================
+              precision    recall  f1-score   support
+
+         SP1     0.5820    0.3471    0.4349       726
+         SP2     0.5859    0.3114    0.4066       668
+         SP4     0.3369    0.7382    0.4627       634
+    Negative     0.9756    0.7625    0.8560       682
+
+    accuracy                         0.5343      2710
+   macro avg     0.6201    0.5398    0.5400      2710
+weighted avg     0.6247    0.5343    0.5404      2710

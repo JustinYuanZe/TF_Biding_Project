@@ -1,0 +1,12 @@
+CLASSIFICATION REPORT -- Simplified Cross-Modal Attention (Script 18)
+============================================================
+              precision    recall  f1-score   support
+
+         SP1     0.5465    0.6157    0.5790       726
+         SP2     0.5307    0.5180    0.5242       668
+         SP4     0.4439    0.4243    0.4339       634
+    Negative     0.9243    0.8592    0.8906       682
+
+    accuracy                         0.6081      2710
+   macro avg     0.6113    0.6043    0.6069      2710
+weighted avg     0.6137    0.6081    0.6100      2710

@@ -1,0 +1,12 @@
+CLASSIFICATION REPORT -- G-CMAB Safe Core (Script 19)
+============================================================
+              precision    recall  f1-score   support
+
+         SP1     0.5277    0.6570    0.5853       726
+         SP2     0.5956    0.4476    0.5111       668
+         SP4     0.4142    0.4495    0.4312       634
+    Negative     0.9497    0.8578    0.9014       682
+
+    accuracy                         0.6074      2710
+   macro avg     0.6218    0.6030    0.6072      2710
+weighted avg     0.6241    0.6074    0.6105      2710
