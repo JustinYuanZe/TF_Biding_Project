@@ -1,29 +1,20 @@
-#!/usr/bin/env python3
 """
-Extract DNA sequences (FASTA) from an indexed reference genome (hg38.fa + hg38.fa.fai).
-
-Designed for Google Colab with hg38.fa stored on Google Drive.
-Uses binary seek on the .fai index — fast, low memory, no external dependencies.
-Preserves original casing (upper/lowercase) and N characters as-is.
-
-Usage:
-    python extract_fasta.py --fasta /content/drive/MyDrive/ML_Project/data/hg38.fa
-    python extract_fasta.py --test   # run built-in unit tests
+Extract FASTA sequences from an indexed genome using .fai index.
 """
 
+import argparse
 import os
 import sys
-import argparse
 import time
-
+from typing import Any, Dict
 
 class FastaIndexedReader:
     """Read sequences from an indexed FASTA file using byte-level seek."""
 
-    def __init__(self, fa_path):
+    def __init__(self, fa_path: str) -> None:
         self.fa_path = fa_path
         self.fai_path = fa_path + ".fai"
-        self.index = {}
+        self.index: Dict[str, Dict[str, int]] = {}
         self.fa_file = None
 
         if not os.path.exists(self.fa_path):
@@ -37,7 +28,7 @@ class FastaIndexedReader:
         self._load_index()
         self.fa_file = open(self.fa_path, 'rb')
 
-    def _load_index(self):
+    def _load_index(self) -> None:
         """Parse the .fai index file."""
         with open(self.fai_path, 'r') as f:
             for line in f:
@@ -52,7 +43,7 @@ class FastaIndexedReader:
                     }
         print(f"Loaded index for {len(self.index)} chromosomes.")
 
-    def get_sequence(self, chrom, start, end):
+    def get_sequence(self, chrom: str, start: int, end: int) -> str:
         """Extract sequence from chrom:start-end (0-based, half-open BED coordinates)."""
         if chrom not in self.index:
             alt = chrom[3:] if chrom.startswith('chr') else 'chr' + chrom
@@ -84,19 +75,19 @@ class FastaIndexedReader:
         seq = data.decode('ascii', errors='ignore').replace('\n', '').replace('\r', '')
         return seq[:length]
 
-    def close(self):
+    def close(self) -> None:
         if self.fa_file:
             self.fa_file.close()
             self.fa_file = None
 
-    def __enter__(self):
+    def __enter__(self) -> 'FastaIndexedReader':
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
 
-def process_bed_file(bed_path, reader, out_fasta_path):
+def process_bed_file(bed_path: str, reader: FastaIndexedReader, out_fasta_path: str) -> int:
     """Read a BED file and extract sequences to FASTA."""
     print(f"Processing: {os.path.basename(bed_path)} -> {os.path.basename(out_fasta_path)}")
 
@@ -124,7 +115,7 @@ def process_bed_file(bed_path, reader, out_fasta_path):
     return count
 
 
-def run_self_test():
+def run_self_test() -> None:
     """Run built-in unit tests with a mock genome."""
     print("--- RUNNING SELF-TEST ---")
     mock_fa = "mock_genome.fa"
@@ -178,7 +169,7 @@ def run_self_test():
                 os.remove(p)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Extract FASTA sequences from an indexed genome using .fai index."
     )

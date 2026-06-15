@@ -1,3 +1,7 @@
+"""
+Auto-refactored script: kaggle_cell_script15.py
+Refactored to align with project standards.
+"""
 # Script 15: KAN-Regularized Cross-Modal Attention Dual-Branch
 #
 # DATASETS REQUIRED (Add as Kaggle Input):

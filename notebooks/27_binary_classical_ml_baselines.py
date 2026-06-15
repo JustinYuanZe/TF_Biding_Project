@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Auto-refactored script: 27_binary_classical_ml_baselines.py
+Refactored to align with project standards.
+"""
+"""
 🧬 Script 27: Classical ML Baselines for Binary Transcription Factor Binding Prediction
 ========================================================================================
 Task: Binary classification of SP-family TF binding (Positive: SP1+SP2+SP4) vs. Genomic Negative control.
@@ -24,6 +28,8 @@ import time
 import warnings
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -54,7 +60,7 @@ from sklearn.metrics import (
     classification_report
 )
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIGURATION

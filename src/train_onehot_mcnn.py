@@ -9,35 +9,37 @@ Features:
 - Accuracy-based checkpointing and early stopping
 """
 
+import math
 import os
+import random
 import sys
 import time
-import math
-import random
-import numpy as np
+from typing import List, Optional, Tuple
+
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    average_precision_score,
     classification_report,
     confusion_matrix,
-    roc_curve,
-    auc,
-    precision_recall_curve,
-    average_precision_score,
-    accuracy_score,
     f1_score,
+    precision_recall_curve,
     precision_recall_fscore_support,
+    roc_curve,
 )
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import label_binarize
+from torch.utils.data import DataLoader, TensorDataset
 
 # Model definition (matches src/mcnn_model.py ImprovedOneHotCNN)
 class ImprovedOneHotCNN(nn.Module):
-    def __init__(self, seq_len=101, num_classes=4, embedding_dim=32, branch_channels=64, kernel_sizes=[3, 5, 7, 9], dropout_rate=0.6):
+    def __init__(self, seq_len: int = 101, num_classes: int = 4, embedding_dim: int = 32, branch_channels: int = 64, kernel_sizes: List[int] = [3, 5, 7, 9], dropout_rate: float = 0.6) -> None:
         super().__init__()
         # Categories: A=0, C=1, G=2, T=3, N/Padding=4
         self.embedding = nn.Embedding(5, embedding_dim, padding_idx=4)
@@ -69,7 +71,7 @@ class ImprovedOneHotCNN(nn.Module):
             nn.Linear(64, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, seq_len)
         x = self.embedding(x)  # Shape: (batch_size, seq_len, embedding_dim)
         x = x.transpose(1, 2)  # Shape: (batch_size, embedding_dim, seq_len)
@@ -85,7 +87,7 @@ class ImprovedOneHotCNN(nn.Module):
         out = self.fc_head(feat)
         return out
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> Optional[str]:
     """Search for target_file in absolute paths, Kaggle input, fallback dirs, or current directory."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
@@ -114,14 +116,14 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     """Search for target_file in local path or Kaggle directory."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:
         return os.path.dirname(resolved_path)
     return fallback
 
-def load_fasta(filepath):
+def load_fasta(filepath: str) -> Tuple[List[str], List[str]]:
     """Load sequences and headers from a FASTA file."""
     sequences = []
     headers = []
@@ -145,7 +147,7 @@ def load_fasta(filepath):
             headers.append(current_header)
     return sequences, headers
 
-def seqs_to_indices(sequences):
+def seqs_to_indices(sequences: List[str]) -> np.ndarray:
     """Map nucleotides to integer indices (A=0, C=1, G=2, T=3, N=4)."""
     mapping = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
     n = len(sequences)
@@ -156,7 +158,7 @@ def seqs_to_indices(sequences):
             indices[i, j] = mapping.get(nuc, 4)
     return indices
 
-def main():
+def main() -> None:
     # Seeds
     random.seed(42)
     np.random.seed(42)
@@ -453,7 +455,7 @@ def main():
     print(f"\nAll figures saved to: {fig_dir}")
     
     # 7. Post-processing: Export BED files for IGV Analysis
-    def parse_header_to_bed(header):
+    def parse_header_to_bed(header: str) -> Optional[Tuple[str, str, str]]:
         try:
             clean_hdr = header.split("_")[0]
             chrom, coords = clean_hdr.split(":")

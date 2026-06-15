@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Auto-refactored script: 13_binary_sanity_check_kaggle.py
+Refactored to align with project standards.
+"""
+"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  Script 13: BINARY SANITY CHECK — Positive vs Negative             ║
 ║  Designed for: Kaggle GPU (T4/P100) or Google Colab                ║
@@ -62,12 +66,6 @@ import os
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-from huggingface_hub.utils import disable_progress_bars
-disable_progress_bars()
-
 import gc
 import math
 import time
@@ -76,6 +74,8 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -96,6 +96,12 @@ from sklearn.metrics import (
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from tqdm import tqdm
 
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -106,7 +112,7 @@ if torch.cuda.is_available():
 # CELL 2: Configuration — BINARY (2-class)
 # ═══════════════════════════════════════════════════════════════════════
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> str | None:
     """Search for target_file in absolute paths, Kaggle input, fallback dirs, or current directory."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
@@ -135,7 +141,7 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     """Search for target_file in local path or Kaggle directory."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:

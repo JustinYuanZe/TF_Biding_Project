@@ -1,3 +1,7 @@
+"""
+Auto-refactored script: diagnose_script19.py
+Refactored to align with project standards.
+"""
 import os
 import numpy as np
 import torch

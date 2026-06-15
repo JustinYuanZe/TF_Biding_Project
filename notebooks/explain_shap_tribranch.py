@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Auto-refactored script: explain_shap_tribranch.py
+Refactored to align with project standards.
+"""
+"""
 Diagnostic Script: Customized SHAP Interpretability Analysis for G-CMAB msCNN.
 Allows running SHAP with different window sizes or absolute sequence indexing.
 Usage:

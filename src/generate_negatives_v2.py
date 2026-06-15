@@ -25,21 +25,19 @@ Usage:
     --plan both
 """
 
-import os
-import sys
-import random
 import argparse
+import gzip
+import os
+import random
+import sys
 import time
-from collections import Counter, defaultdict
+import urllib.request
 from bisect import bisect_left, bisect_right
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
 # Optional imports for downloads
-try:
-    import urllib.request
-    import gzip
-    HAS_DOWNLOAD = True
-except ImportError:
-    HAS_DOWNLOAD = False
+HAS_DOWNLOAD = True
 
 # ============================================================
 # Configuration
@@ -66,7 +64,7 @@ CPG_ISLAND_URL = ("https://hgdownload.cse.ucsc.edu/goldenpath/hg38/"
 class FastaIndexedReader:
     """Read sequences from an indexed FASTA file using byte-level seek."""
 
-    def __init__(self, fa_path):
+    def __init__(self, fa_path: str) -> None:
         self.fa_path = fa_path
         self.fai_path = fa_path + ".fai"
         self.index = {}
@@ -82,7 +80,7 @@ class FastaIndexedReader:
         self._load_index()
         self.fa_file = open(self.fa_path, 'rb')
 
-    def _load_index(self):
+    def _load_index(self) -> None:
         with open(self.fai_path, 'r') as f:
             for line in f:
                 parts = line.strip().split('\t')
@@ -94,7 +92,7 @@ class FastaIndexedReader:
                         'line_bytes': int(parts[4]),
                     }
 
-    def get_sequence(self, chrom, start, end):
+    def get_sequence(self, chrom: str, start: int, end: int) -> Optional[str]:
         """Extract sequence from chrom:start-end (0-based, half-open)."""
         if chrom not in self.index:
             return None
@@ -120,18 +118,18 @@ class FastaIndexedReader:
                           ).replace('\n', '').replace('\r', '')
         return seq[:length]
 
-    def get_chrom_sizes(self):
+    def get_chrom_sizes(self) -> Dict[str, int]:
         return {c: self.index[c]['length']
                 for c in self.index if c in VALID_CHROMS}
 
-    def close(self):
+    def close(self) -> None:
         if self.fa_file:
             self.fa_file.close()
 
-    def __enter__(self):
+    def __enter__(self) -> 'FastaIndexedReader':
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
 
@@ -142,15 +140,15 @@ class FastaIndexedReader:
 class ExclusionZones:
     """Manages genomic intervals to exclude (peaks + blacklist)."""
 
-    def __init__(self):
-        self._raw = defaultdict(list)
-        self._merged = {}
-        self._starts = {}
+    def __init__(self) -> None:
+        self._raw: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        self._merged: Dict[str, List[Tuple[int, int]]] = {}
+        self._starts: Dict[str, List[int]] = {}
 
-    def add(self, chrom, start, end):
+    def add(self, chrom: str, start: int, end: int) -> None:
         self._raw[chrom].append((start, end))
 
-    def finalize(self):
+    def finalize(self) -> None:
         """Sort and merge overlapping intervals per chromosome."""
         total = 0
         total_bp = 0
@@ -169,7 +167,7 @@ class ExclusionZones:
         print(f"  Exclusion zones: {total:,} merged intervals, "
               f"{total_bp / 1e6:.1f} Mbp across {len(self._merged)} chroms")
 
-    def overlaps(self, chrom, start, end):
+    def overlaps(self, chrom: str, start: int, end: int) -> bool:
         """Check if region [start, end) overlaps any exclusion zone."""
         if chrom not in self._merged:
             return False
@@ -188,19 +186,19 @@ class ExclusionZones:
 # Utility Functions
 # ============================================================
 
-def gc_content(seq):
+def gc_content(seq: str) -> float:
     """GC content as fraction (0.0–1.0)."""
     s = seq.upper()
     gc = s.count('G') + s.count('C')
     return gc / len(s) if len(s) > 0 else 0.0
 
 
-def n_fraction(seq):
+def n_fraction(seq: str) -> float:
     """Fraction of N characters."""
     return seq.upper().count('N') / len(seq) if seq else 1.0
 
 
-def stdev(values):
+def stdev(values: List[float]) -> float:
     """Standard deviation (sample)."""
     n = len(values)
     if n < 2:
@@ -209,7 +207,7 @@ def stdev(values):
     return (sum((x - mean) ** 2 for x in values) / (n - 1)) ** 0.5
 
 
-def read_fasta(filepath):
+def read_fasta(filepath: str) -> List[Tuple[str, str]]:
     """Parse FASTA file → list of (header, sequence)."""
     records = []
     with open(filepath, 'r') as f:
@@ -228,7 +226,7 @@ def read_fasta(filepath):
     return records
 
 
-def write_fasta(filepath, records):
+def write_fasta(filepath: str, records: List[Tuple[str, str]]) -> None:
     """Write list of (header, sequence) to FASTA."""
     os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
     with open(filepath, 'w', newline='\n') as f:
@@ -236,7 +234,7 @@ def write_fasta(filepath, records):
             f.write(f"{header}\n{seq.upper()}\n")
 
 
-def read_bed(filepath):
+def read_bed(filepath: str) -> List[Tuple[str, int, int]]:
     """Read BED file → list of (chrom, start, end)."""
     records = []
     with open(filepath, 'r') as f:
@@ -257,7 +255,7 @@ def read_bed(filepath):
 # Download Helpers
 # ============================================================
 
-def download_bed_gz(url, label, cache_dir):
+def download_bed_gz(url: str, label: str, cache_dir: str) -> List[Tuple[str, int, int]]:
     """Download a gzipped BED file, cache locally, return intervals."""
     if not HAS_DOWNLOAD:
         print(f"  ⚠ urllib not available, skipping {label}")
@@ -290,7 +288,7 @@ def download_bed_gz(url, label, cache_dir):
     return intervals
 
 
-def download_cpg_islands(cache_dir):
+def download_cpg_islands(cache_dir: str) -> List[Tuple[str, int, int]]:
     """Download CpG island annotations from UCSC."""
     if not HAS_DOWNLOAD:
         print(f"  ⚠ urllib not available, skipping CpG islands")
@@ -327,8 +325,8 @@ def download_cpg_islands(cache_dir):
 # Plan B: GC-matched Random Genomic Regions
 # ============================================================
 
-def generate_random_candidates(reader, chrom_sizes, exclusion,
-                               n_candidates, rng):
+def generate_random_candidates(reader: FastaIndexedReader, chrom_sizes: Dict[str, int], exclusion: ExclusionZones,
+                               n_candidates: int, rng: random.Random) -> List[Tuple[str, int, int, str, float]]:
     """Generate random 101bp candidate regions from the genome."""
     print(f"\n  Generating {n_candidates:,} random candidate regions...")
 
@@ -409,8 +407,8 @@ def generate_random_candidates(reader, chrom_sizes, exclusion,
     return valid
 
 
-def gc_match_sample(candidates, positive_gc_values, target_n,
-                    bin_size, rng):
+def gc_match_sample(candidates: List[Tuple[str, int, int, str, float]], positive_gc_values: List[float], target_n: int,
+                    bin_size: float, rng: random.Random) -> List[Tuple[str, int, int, str, float]]:
     """Sample candidates to match the GC distribution of positives."""
     print(f"\n  GC-matching {len(candidates):,} candidates → "
           f"{target_n:,} targets...")
@@ -492,8 +490,8 @@ def gc_match_sample(candidates, positive_gc_values, target_n,
 # Plan C: CpG Island Negatives
 # ============================================================
 
-def generate_cpg_negatives(reader, cpg_islands, exclusion,
-                           target_n, rng):
+def generate_cpg_negatives(reader: FastaIndexedReader, cpg_islands: List[Tuple[str, int, int]], exclusion: ExclusionZones,
+                           target_n: int, rng: random.Random) -> List[Tuple[str, int, int, str, float]]:
     """Generate negatives from CpG island regions not overlapping peaks."""
     print(f"\n  Extracting candidates from {len(cpg_islands):,} CpG islands...")
 
@@ -575,13 +573,13 @@ def generate_cpg_negatives(reader, cpg_islands, exclusion,
 # QC Report
 # ============================================================
 
-def print_qc_report(pos_gc, neg_b_gc, neg_c_gc=None):
+def print_qc_report(pos_gc: List[float], neg_b_gc: List[float], neg_c_gc: Optional[List[float]] = None) -> None:
     """Print QC comparison of GC distributions."""
     print(f"\n{'='*70}")
     print(f"  QC REPORT — GC-content Distribution Comparison")
     print(f"{'='*70}")
 
-    def show_stats(values, label):
+    def show_stats(values: List[float], label: str) -> None:
         n = len(values)
         mean = sum(values) / n * 100
         sd = stdev(values) * 100
@@ -638,7 +636,7 @@ def print_qc_report(pos_gc, neg_b_gc, neg_c_gc=None):
 # Overlap Verification
 # ============================================================
 
-def verify_no_overlap(neg_records, peak_beds, label):
+def verify_no_overlap(neg_records: List[Tuple[str, str]], peak_beds: List[str], label: str) -> int:
     """Verify that no negative overlaps with any positive peak."""
     print(f"\n  Verifying {label}: no overlap with positive peaks...")
 
@@ -682,7 +680,7 @@ def verify_no_overlap(neg_records, peak_beds, label):
 # Main
 # ============================================================
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate biologically sound negative datasets for TFBS",
         formatter_class=argparse.RawDescriptionHelpFormatter,

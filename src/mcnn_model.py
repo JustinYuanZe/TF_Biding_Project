@@ -1,11 +1,19 @@
+"""
+Multi-Scale Convolutional Neural Network (mCNN) models for DNA sequence classification.
+"""
+
+from typing import List
+
 import torch
 import torch.nn as nn
+
 
 class Conv1DBranch(nn.Module):
     """
     A single branch of the mCNN with Conv1d -> BatchNorm1d -> ReLU -> GlobalMaxPool1d.
     """
-    def __init__(self, in_channels, out_channels, kernel_size, padding):
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, padding: int) -> None:
         super(Conv1DBranch, self).__init__()
         self.conv = nn.Conv1d(
             in_channels=in_channels,
@@ -17,7 +25,7 @@ class Conv1DBranch(nn.Module):
         self.relu = nn.ReLU()
         self.pool = nn.AdaptiveMaxPool1d(1) # Extract position-invariant maximum signal
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
         x = self.bn(x)
         x = self.relu(x)
@@ -31,7 +39,7 @@ class MultiScaleCNN(nn.Module):
     Takes DNABERT-2 embeddings of shape (batch_size, seq_len, embedding_dim)
     and applies parallel convolutions of different scale widths to detect motifs.
     """
-    def __init__(self, embedding_dim=768, branch_channels=128, kernel_sizes=[3, 5, 7, 9], num_classes=4, dropout_rate=0.5):
+    def __init__(self, embedding_dim: int = 768, branch_channels: int = 128, kernel_sizes: List[int] = [3, 5, 7, 9], num_classes: int = 4, dropout_rate: float = 0.5) -> None:
         super(MultiScaleCNN, self).__init__()
         
         self.branches = nn.ModuleList([
@@ -55,7 +63,7 @@ class MultiScaleCNN(nn.Module):
             nn.Linear(128, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Input shape: (batch_size, seq_len, embedding_dim)
         # Conv1d expects shape: (batch_size, embedding_dim, seq_len)
         x = x.transpose(1, 2)
@@ -80,7 +88,7 @@ class ImprovedOneHotCNN(nn.Module):
     3. Global MAX + AVG Pooling: MAX captures motif presence; AVG captures motif abundance/frequency.
     4. Small model capacity (~85K parameters) to avoid memorizing small training sets.
     """
-    def __init__(self, seq_len=101, num_classes=4, embedding_dim=32, branch_channels=64, kernel_sizes=[3, 5, 7, 9], dropout_rate=0.6):
+    def __init__(self, seq_len: int = 101, num_classes: int = 4, embedding_dim: int = 32, branch_channels: int = 64, kernel_sizes: List[int] = [3, 5, 7, 9], dropout_rate: float = 0.6) -> None:
         super(ImprovedOneHotCNN, self).__init__()
         # Categories: A=0, C=1, G=2, T=3, N/Padding=4
         self.embedding = nn.Embedding(5, embedding_dim, padding_idx=4)
@@ -113,7 +121,7 @@ class ImprovedOneHotCNN(nn.Module):
             nn.Linear(64, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, seq_len) -> integer indices
         x = self.embedding(x)  # Shape: (batch_size, seq_len, embedding_dim)
         x = x.transpose(1, 2)  # Shape: (batch_size, embedding_dim, seq_len)

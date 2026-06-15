@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script 14: Cross-Modal Attention Dual-Branch (DNABERT-2 + DNAshape CNN)
+Script 25: Binary Cross-Modal Attention Dual-Branch (DNABERT-2 + DNAshape CNN)
 Designed for: Kaggle GPU (T4/P100) or Google Colab
 Task: Binary SP_Positive/Negative TF-binding classification
 
@@ -74,11 +74,13 @@ import gc
 import math
 import time
 import random
-import sys
 import warnings
-warnings.filterwarnings("ignore")
+import builtins
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -115,7 +117,6 @@ DEVICE = accelerator.device
 
 # Redefine print globally to suppress non-main process logging in DDP/Multi-GPU
 if not accelerator.is_main_process:
-    import builtins
     builtins.print = lambda *args, **kwargs: None
 
 print(f"PyTorch version: {torch.__version__}")
@@ -128,7 +129,7 @@ if torch.cuda.is_available():
 # CELL 2: Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> str | None:
     """Search for target_file in absolute paths, Kaggle input, fallback dirs, or current directory."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
@@ -149,6 +150,10 @@ def find_file(filename, fallback_dir="data/processed"):
         p2 = os.path.join(fallback_dir, "fixed_negative", filename)
         if os.path.exists(p2):
             return p2
+        # Recursive fallback search
+        for root, _, files in os.walk(fallback_dir):
+            if filename in files:
+                return os.path.join(root, filename)
 
     # 3. Check current working directory
     if os.path.exists(filename):
@@ -157,7 +162,7 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     """Search for the directory containing target_file in Kaggle input or local path."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:
@@ -243,7 +248,7 @@ torch.manual_seed(cfg.RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(cfg.RANDOM_SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE already set by accelerator at line 114
 print(f"\nUsing device: {DEVICE}")
 print(f"Architecture: Cross-Modal Attention Dual-Branch (DNABERT-2 + DNAshape)")
 print(f"  * Cross-Attention d_model: {cfg.CROSS_ATTN_D_MODEL}")
@@ -257,7 +262,7 @@ print(f"Effective batch size: {cfg.BATCH_SIZE} x {cfg.GRAD_ACCUM_STEPS} = {cfg.B
 # CELL 3: Data Loading (Sequences + DNAshape Features)
 # ═══════════════════════════════════════════════════════════════════════
 
-def load_fasta(filepath):
+def load_fasta(filepath: str) -> tuple[list[str], list[str]]:
     """Load DNA sequences and their headers from a FASTA file."""
     sequences = []
     headers = []
@@ -297,7 +302,7 @@ def load_shape_features(data_dir, shape_files):
     if not neg_shape_path:
         raise FileNotFoundError("Could not find any negative DNAshape file among candidates.")
 
-    print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
+    if accelerator.is_main_process: print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
 
     resolved_paths = {}
     for cls_name, fname in shape_files.items():
@@ -311,7 +316,7 @@ def load_shape_features(data_dir, shape_files):
 
     for cls_name, fpath in resolved_paths.items():
         shape_data = np.load(fpath)
-        print(f"  {cls_name} shape: {shape_data.shape} ({os.path.basename(fpath)})")
+        if accelerator.is_main_process: print(f"  {cls_name} shape: {shape_data.shape} ({os.path.basename(fpath)})")
         all_shapes.append(shape_data)
 
     return np.concatenate(all_shapes, axis=0)
@@ -319,9 +324,10 @@ def load_shape_features(data_dir, shape_files):
 
 def load_all_data(fasta_dir, shape_dir, shape_files):
     """Load all 4 classes: sequences + shape features + group-aware labels."""
-    print("=" * 60)
-    print("LOADING DATASETS (Sequences + DNAshape Features)")
-    print("=" * 60)
+    if accelerator.is_main_process:
+        print("=" * 60)
+        print("LOADING DATASETS (Sequences + DNAshape Features)")
+        print("=" * 60)
 
     neg_fasta_path = None
     fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
@@ -334,7 +340,7 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     if not neg_fasta_path:
         raise FileNotFoundError("Could not find any negative FASTA file among candidates.")
 
-    print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
+    if accelerator.is_main_process: print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
 
     fasta_files = {
         "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
@@ -347,15 +353,12 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         if not fpath:
             raise FileNotFoundError(f"Missing FASTA file for {cls_name}")
 
-    all_sequences = []
-    all_headers = []
-    all_labels = []
-    all_groups = []
+    all_sequences, all_headers, all_labels, all_groups = [], [], [], []
     group_id = 0
 
     for cls_idx, (cls_name, fpath) in enumerate(fasta_files.items()):
         seqs, hdrs = load_fasta(fpath)
-        print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
+        if accelerator.is_main_process: print(f"  {cls_name}: {len(seqs)} sequences ({os.path.basename(fpath)})")
         all_sequences.extend(seqs)
         all_headers.extend(hdrs)
         all_labels.extend([cls_idx] * len(seqs))
@@ -372,25 +375,27 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
     all_labels = np.array(all_labels)
     all_groups = np.array(all_groups)
 
-    print("\n  Loading DNAshape features...")
+    if accelerator.is_main_process: print("\n  Loading DNAshape features...")
     all_shapes = load_shape_features(shape_dir, shape_files)
 
     assert len(all_sequences) == all_shapes.shape[0], (
         f"Sequence count ({len(all_sequences)}) != shape count ({all_shapes.shape[0]})"
     )
 
-    print(f"\n  Total: {len(all_sequences)} sequences, {group_id} groups")
-    print(f"  Shape features: {all_shapes.shape}")
-    print(f"  Class distribution: {np.bincount(all_labels)}")
+    if accelerator.is_main_process:
+        print(f"\n  Total: {len(all_sequences)} sequences, {group_id} groups")
+        print(f"  Shape features: {all_shapes.shape}")
+        print(f"  Class distribution: {np.bincount(all_labels)}")
 
     return all_sequences, all_labels, all_groups, all_shapes, all_headers
 
 
 def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=42):
     """Group-aware train/test split."""
-    print("\n" + "=" * 60)
-    print("SPLITTING DATA (GroupShuffleSplit — no revcomp leakage)")
-    print("=" * 60)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("SPLITTING DATA (GroupShuffleSplit — no revcomp leakage)")
+        print("=" * 60)
 
     gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
     train_idx, test_idx = next(gss.split(sequences, labels, groups))
@@ -404,10 +409,11 @@ def split_data(sequences, labels, groups, shapes, headers, test_size=0.2, seed=4
     headers_train = [headers[i] for i in train_idx]
     headers_test = [headers[i] for i in test_idx]
 
-    print(f"  Train: {len(seq_train)} sequences")
-    print(f"  Test:  {len(seq_test)} sequences")
-    print(f"  Train class dist: {np.bincount(y_train)}")
-    print(f"  Test  class dist: {np.bincount(y_test)}")
+    if accelerator.is_main_process:
+        print(f"  Train: {len(seq_train)} sequences")
+        print(f"  Test:  {len(seq_test)} sequences")
+        print(f"  Train class dist: {np.bincount(y_train)}")
+        print(f"  Test  class dist: {np.bincount(y_test)}")
 
     return seq_train, seq_test, y_train, y_test, shape_train, shape_test, headers_train, headers_test
 
@@ -434,9 +440,10 @@ gc.collect()
 
 def robust_normalize_shapes(shape_train, shape_test):
     """Apply Robust Scaler normalization per channel. Stats from TRAINING SET ONLY."""
-    print("\n" + "=" * 60)
-    print("NORMALIZING DNAshape FEATURES (Robust Scaler P1-P99)")
-    print("=" * 60)
+    if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("NORMALIZING DNAshape FEATURES (Robust Scaler P1-P99)")
+        print("=" * 60)
 
     n_channels = shape_train.shape[1]
     channel_names = ["MGW", "ProT", "Roll", "HelT", "EP"]
@@ -451,15 +458,12 @@ def robust_normalize_shapes(shape_train, shape_test):
         median_val = np.median(valid_vals)
         p1_val = np.percentile(valid_vals, 1)
         p99_val = np.percentile(valid_vals, 99)
-        scale = p99_val - p1_val
-
-        if scale < 1e-9:
-            scale = 1.0
+        scale = max(p99_val - p1_val, 1e-9)
 
         shape_train_norm[:, ch, :] = (shape_train_norm[:, ch, :] - median_val) / scale
         shape_test_norm[:, ch, :] = (shape_test_norm[:, ch, :] - median_val) / scale
 
-        print(f"  {channel_names[ch]:>5s}: median={median_val:>8.4f}, "
+        if accelerator.is_main_process: print(f"  {channel_names[ch]:>5s}: median={median_val:>8.4f}, "
               f"P1={p1_val:>8.4f}, P99={p99_val:>8.4f}, scale={scale:>8.4f}")
 
     nan_count_train = np.isnan(shape_train_norm).sum()
@@ -467,9 +471,10 @@ def robust_normalize_shapes(shape_train, shape_test):
     shape_train_norm = np.nan_to_num(shape_train_norm, nan=0.0)
     shape_test_norm = np.nan_to_num(shape_test_norm, nan=0.0)
 
-    print(f"\n  NaN filled with 0: train={nan_count_train}, test={nan_count_test}")
-    print(f"  Train shape range: [{shape_train_norm.min():.4f}, {shape_train_norm.max():.4f}]")
-    print(f"  Test  shape range: [{shape_test_norm.min():.4f}, {shape_test_norm.max():.4f}]")
+    if accelerator.is_main_process:
+        print(f"\n  NaN filled with 0: train={nan_count_train}, test={nan_count_test}")
+        print(f"  Train shape range: [{shape_train_norm.min():.4f}, {shape_train_norm.max():.4f}]")
+        print(f"  Test  shape range: [{shape_test_norm.min():.4f}, {shape_test_norm.max():.4f}]")
 
     return shape_train_norm, shape_test_norm
 
@@ -556,7 +561,7 @@ def patch_flash_attention():
 # CELL 6: Load DNABERT-2 Backbone (with Selective Unfreezing)
 # ═══════════════════════════════════════════════════════════════════════
 
-def load_dnabert2(model_name, device, unfreeze_last_n=3):
+def load_dnabert2(model_name, unfreeze_last_n=3):
     """Load DNABERT-2 with selective layer unfreezing directly using state_dict load (avoiding meta device issues)."""
     print("\n" + "=" * 60)
     print("LOADING DNABERT-2 BACKBONE (Selective Fine-Tuning)")
@@ -607,12 +612,12 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
             for param in layer.parameters():
                 param.requires_grad = True
 
-    model = model.to(device)
+    # Device placement handled by accelerator.prepare()
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"\n  DNABERT-2 loaded on {device}")
+    print("\n  DNABERT-2 loaded")
     print(f"  Total encoder layers: {total_layers}")
     print(f"  Frozen layers:    0 - {unfreeze_from - 1}")
     print(f"  Unfrozen layers:  {unfreeze_from} - {total_layers - 1} ({unfreeze_last_n} layers)")
@@ -623,7 +628,7 @@ def load_dnabert2(model_name, device, unfreeze_last_n=3):
 
 
 dnabert_model, tokenizer = load_dnabert2(
-    cfg.DNABERT_MODEL, DEVICE, unfreeze_last_n=cfg.UNFREEZE_LAST_N_LAYERS
+    cfg.DNABERT_MODEL, unfreeze_last_n=cfg.UNFREEZE_LAST_N_LAYERS
 )
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1022,10 +1027,10 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, accelerator_
 
     pbar = tqdm(loader, desc="  Training", leave=False, disable=not accelerator_obj.is_main_process)
     for step, batch in enumerate(pbar):
-        input_ids = batch["input_ids"].to(accelerator_obj.device)
-        attention_mask = batch["attention_mask"].to(accelerator_obj.device)
-        shape_features = batch["shape_features"].to(accelerator_obj.device)
-        labels = batch["labels"].to(accelerator_obj.device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
 
         with accelerator_obj.accumulate(model):
             with accelerator_obj.autocast():
@@ -1071,10 +1076,10 @@ def evaluate(model, loader, criterion, accelerator_obj):
     correct = 0
     total = 0
     for batch in loader:
-        input_ids = batch["input_ids"].to(accelerator_obj.device)
-        attention_mask = batch["attention_mask"].to(accelerator_obj.device)
-        shape_features = batch["shape_features"].to(accelerator_obj.device)
-        labels = batch["labels"].to(accelerator_obj.device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        shape_features = batch["shape_features"]
+        labels = batch["labels"]
 
         with accelerator_obj.autocast():
             logits = model(input_ids, attention_mask, shape_features)
@@ -1115,7 +1120,6 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
         val_loss, val_acc = evaluate(model, test_loader, criterion, accelerator_obj)
 
         elapsed = time.time() - t0
-        gap = train_acc - val_acc
 
         # Synchronize training metrics across all processes for consistent logging and stopping decisions
         train_loss_tensor = torch.tensor(train_loss, device=accelerator_obj.device)
@@ -1195,14 +1199,11 @@ print(f"Loaded best model from epoch {checkpoint['epoch']} "
 
 @torch.no_grad()
 def full_evaluation(model, test_loader, class_names, accelerator):
-    """Run full evaluation and return predictions/probabilities using Accelerator."""
+    """Run full evaluation and return predictions/probabilities."""
     model.eval()
     all_preds, all_targets, all_probs = [], [], []
 
-    total_batches = len(test_loader)
-    last_percent = -1
-
-    for step, batch in enumerate(test_loader):
+    for batch in tqdm(test_loader, desc="  Evaluating", disable=not accelerator.is_main_process):
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
         shape_features = batch["shape_features"]
@@ -1219,22 +1220,6 @@ def full_evaluation(model, test_loader, class_names, accelerator):
         all_preds.extend(preds_g.cpu().numpy())
         all_targets.extend(labels_g.cpu().numpy())
         all_probs.extend(probs_g.cpu().numpy())
-
-        # Update and print progress every 1% increment with a visual progress bar
-        percent = int((step + 1) / total_batches * 100)
-        if percent > last_percent:
-            if accelerator.is_main_process:
-                bar_len = 20
-                filled_len = int(bar_len * percent / 100)
-                bar = "█" * filled_len + "░" * (bar_len - filled_len)
-                sys.stdout.write(f"\r  Evaluating: [{bar}] {percent}%   ")
-                sys.stdout.flush()
-            last_percent = percent
-
-    # Clear the temporary evaluation line
-    if accelerator.is_main_process:
-        sys.stdout.write("\r" + " " * 80 + "\r")
-        sys.stdout.flush()
 
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
@@ -1274,43 +1259,30 @@ def parse_header_to_bed(header):
     except Exception:
         return None
 
-def export_igv_bed_files(headers_test, predictions, targets, output_dir):
+def export_igv_bed_files(headers_test, predictions, targets, output_dir, class_names=None):
+    if class_names is not None and len(class_names) <= 2:
+        print(f"\n  Skipping BED export (binary classifier, not applicable)")
+        return
     os.makedirs(output_dir, exist_ok=True)
-
-    true_sp1_coords = []
-    true_sp4_coords = []
-    confused_sp4_as_sp1_coords = []
-
+    beds = {"True_SP1": [], "True_SP4": [], "Confused_SP4_as_SP1": []}
     for idx, (pred, target) in enumerate(zip(predictions, targets)):
-        header = headers_test[idx]
-        bed_fields = parse_header_to_bed(header)
-        if not bed_fields:
+        fields = parse_header_to_bed(headers_test[idx])
+        if not fields:
             continue
-
-        chrom, start, end = bed_fields
-        bed_line = f"{chrom}\t{start}\t{end}\n"
-
+        line = f"{fields[0]}\t{fields[1]}\t{fields[2]}\n"
         if target == 0 and pred == 0:
-            true_sp1_coords.append(bed_line)
+            beds["True_SP1"].append(line)
         elif target == 2 and pred == 2:
-            true_sp4_coords.append(bed_line)
+            beds["True_SP4"].append(line)
         elif target == 2 and pred == 0:
-            confused_sp4_as_sp1_coords.append(bed_line)
-
-    with open(os.path.join(output_dir, "True_SP1.bed"), "w") as f:
-        f.writelines(true_sp1_coords)
-    with open(os.path.join(output_dir, "True_SP4.bed"), "w") as f:
-        f.writelines(true_sp4_coords)
-    with open(os.path.join(output_dir, "Confused_SP4_as_SP1.bed"), "w") as f:
-        f.writelines(confused_sp4_as_sp1_coords)
-
-    print(f"\n  Exported BED files for IGV analysis to {output_dir}:")
-    print(f"    - True_SP1.bed: {len(true_sp1_coords)} lines")
-    print(f"    - True_SP4.bed: {len(true_sp4_coords)} lines")
-    print(f"    - Confused_SP4_as_SP1.bed: {len(confused_sp4_as_sp1_coords)} lines")
+            beds["Confused_SP4_as_SP1"].append(line)
+    for name, lines in beds.items():
+        with open(os.path.join(output_dir, f"{name}.bed"), "w") as f:
+            f.writelines(lines)
+        print(f"    {name}.bed: {len(lines)} lines")
 
 if accelerator.is_main_process:
-    export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR)
+    export_igv_bed_files(headers_test, all_preds, all_targets, cfg.OUTPUT_DIR, cfg.CLASS_NAMES)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CELL 12: Generate All Performance Figures

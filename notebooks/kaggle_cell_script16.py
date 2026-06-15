@@ -1,3 +1,7 @@
+"""
+Auto-refactored script: kaggle_cell_script16.py
+Refactored to align with project standards.
+"""
 # Script 16: Unified Cross-Modal Attention Dual-Branch (DNABERT-2 + DNAshape)
 #
 # DATASETS REQUIRED (Add as Kaggle Input):

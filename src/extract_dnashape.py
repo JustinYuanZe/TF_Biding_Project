@@ -1,14 +1,22 @@
+"""
+Extract DNAshape features (MGW, ProT, Roll, HelT, EP) from DNA sequences
+using a pre-computed pentamer lookup table.
+"""
+
 import os
+from typing import List, Tuple
+
 import numpy as np
+
 from dnashape_lookup import DNASHAPE_LOOKUP
 
-def revcomp(seq):
+def revcomp(seq: str) -> str:
     comp = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G'}
     return "".join(comp.get(base, base) for base in reversed(seq))
 
-def load_fasta(file_path):
-    sequences = []
-    headers = []
+def load_fasta(file_path: str) -> Tuple[List[str], List[str]]:
+    sequences: List[str] = []
+    headers: List[str] = []
     with open(file_path, 'r') as f:
         current_seq = []
         for line in f:
@@ -24,7 +32,7 @@ def load_fasta(file_path):
             sequences.append("".join(current_seq).upper())
     return headers, sequences
 
-def compute_shape_features(sequence):
+def compute_shape_features(sequence: str) -> np.ndarray:
     N = len(sequence)
     # Output arrays
     mgw_arr = np.full(N, np.nan)
@@ -105,7 +113,7 @@ def compute_shape_features(sequence):
     # Return as a matrix [5, N]
     return np.vstack([mgw_arr, prot_arr, roll_arr, helt_arr, ep_arr])
 
-def extract_features_for_fasta(fasta_path, save_npy_path):
+def extract_features_for_fasta(fasta_path: str, save_npy_path: str) -> None:
     print(f"Extracting features from {fasta_path}...")
     headers, sequences = load_fasta(fasta_path)
     

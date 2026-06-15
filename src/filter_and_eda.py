@@ -1,7 +1,15 @@
+"""
+Filtering and Exploratory Data Analysis of TF peak data.
+Applies quality filters, generates KDE plots, centers windows around
+peak summits, and enforces mutual exclusivity among different TFs.
+"""
+
 import os
+from typing import Any
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
 # Configuration
@@ -20,19 +28,19 @@ WINDOW_HALF = 50  # 50bp left + summit + 50bp right = 101bp
 # Column names for narrowPeak/ENCODE bed format
 COLS = ['chrom', 'start', 'end', 'name', 'score', 'strand', 'signal', 'pval', 'qval', 'peak']
 
-def load_data(name, path):
+def load_data(name: str, path: str) -> pd.DataFrame:
     print(f"Loading {name} raw data from {path}...")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Raw dataset file not found: {path}")
     df = pd.read_csv(path, sep='\t', header=None, names=COLS)
     return df
 
-def apply_filter(df):
+def apply_filter(df: pd.DataFrame) -> pd.DataFrame:
     # Column 9 is 'qval' which is -log10(q-value).
     # q-value <= 0.01 corresponds to -log10(q-value) >= 2.0
     return df[df['qval'] >= 2.0]
 
-def plot_kde(ax, data_before, data_after, column_name, title, xlabel, log_scale=False):
+def plot_kde(ax: plt.Axes, data_before: pd.DataFrame, data_after: pd.DataFrame, column_name: str, title: str, xlabel: str, log_scale: bool = False) -> None:
     # Drop NaNs or infinite values if any
     db = data_before[column_name].dropna()
     da = data_after[column_name].dropna()
@@ -65,7 +73,7 @@ def plot_kde(ax, data_before, data_after, column_name, title, xlabel, log_scale=
     ax.grid(True, linestyle='--', alpha=0.5)
     ax.legend(fontsize=9)
 
-def main():
+def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(FIGURES_DIR, exist_ok=True)
 
@@ -108,7 +116,7 @@ def main():
     df_stats = pd.DataFrame(stats)
     
     # Custom markdown formatter to avoid tabulate dependency
-    def df_to_md(df):
+    def df_to_md(df: pd.DataFrame) -> str:
         headers = list(df.columns)
         md = "| " + " | ".join(headers) + " |\n"
         md += "| " + " | ".join(["---"] * len(headers)) + " |\n"
@@ -150,7 +158,7 @@ def main():
     ax1.grid(True, axis='y', linestyle='--', alpha=0.5)
 
     # Attach a text label above each bar in rects1 and rects2, displaying its height.
-    def autolabel(rects):
+    def autolabel(rects: Any) -> None:
         for rect in rects:
             height = rect.get_height()
             ax1.annotate(f'{height:,}',

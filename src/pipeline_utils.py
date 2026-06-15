@@ -1,22 +1,29 @@
+"""
+Pipeline utilities for end-to-end DNA sequence modeling.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
+
 
 class DNAPipelineDataset(Dataset):
     """
     PyTorch Dataset for on-the-fly tokenization of DNA sequences.
     Avoids storing heavy extracted embeddings in RAM.
     """
-    def __init__(self, sequences, labels, tokenizer, max_length=105):
+    def __init__(self, sequences: List[str], labels: List[int], tokenizer: Any, max_length: int = 105) -> None:
         self.sequences = sequences
         self.labels = torch.tensor(labels, dtype=torch.long)
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         seq = self.sequences[idx]
         label = self.labels[idx]
         
@@ -39,7 +46,7 @@ class DNABERT_mCNN(nn.Module):
     End-to-end model combining DNABERT-2 and Multi-Scale CNN.
     Can run with frozen or unfrozen DNABERT-2 weights.
     """
-    def __init__(self, dnabert_model, mcnn_model, freeze_dnabert=True):
+    def __init__(self, dnabert_model: nn.Module, mcnn_model: nn.Module, freeze_dnabert: bool = True) -> None:
         super(DNABERT_mCNN, self).__init__()
         self.dnabert = dnabert_model
         self.mcnn = mcnn_model
@@ -52,7 +59,7 @@ class DNABERT_mCNN(nn.Module):
         else:
             print("Fine-tuning DNABERT-2 weights along with mCNN...")
 
-    def forward(self, input_ids, attention_mask=None, **kwargs):
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
         # Extract embeddings
         if self.freeze_dnabert:
             with torch.no_grad():
@@ -66,3 +73,4 @@ class DNABERT_mCNN(nn.Module):
         # Pass embeddings to MultiScaleCNN
         logits = self.mcnn(embeddings)
         return logits
+

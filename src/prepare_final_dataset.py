@@ -10,8 +10,9 @@ Prepare final balanced datasets for training (1:1:1:1 ratio).
 """
 
 import os
-import sys
 import random
+import sys
+from typing import Dict, List, Tuple
 
 # Paths
 POS_DIR = "data/processed/positive_datasets_fasta"
@@ -35,11 +36,11 @@ COMPLEMENT = {
     'a': 't', 't': 'a', 'c': 'g', 'g': 'c', 'n': 'n'
 }
 
-def reverse_complement(seq):
+def reverse_complement(seq: str) -> str:
     comp = "".join(COMPLEMENT.get(c, c) for c in seq)
     return comp[::-1]
 
-def read_fasta(path):
+def read_fasta(path: str) -> List[Tuple[str, str]]:
     records = []
     if not os.path.exists(path):
         print(f"Warning: File {path} not found.")
@@ -60,20 +61,20 @@ def read_fasta(path):
             records.append((header, "".join(seq)))
     return records
 
-def write_fasta(path, records):
+def write_fasta(path: str, records: List[Tuple[str, str]]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         for h, s in records:
             f.write(f"{h}\n{s}\n")
 
-def main():
+def main() -> None:
     # Set seed for reproducibility
     random.seed(42)
     print("=== FINAL DATASET PREPARATION (1:1:1:1 Balance) ===")
 
     # 1. Process Positives with Reverse Complement Augmentation
-    pos_records = {}
-    augmented_counts = {}
+    pos_records: Dict[str, List[Tuple[str, str]]] = {}
+    augmented_counts: Dict[str, int] = {}
 
     for tf, fname in POS_FILES.items():
         path = os.path.join(POS_DIR, fname)
@@ -83,7 +84,7 @@ def main():
             sys.exit(1)
         print(f"Loaded {len(records)} original positive sequences for {tf}.")
 
-        augmented_records = []
+        augmented_records: List[Tuple[str, str]] = []
         for h, s in records:
             # Original sequence
             augmented_records.append((h, s))
@@ -112,7 +113,7 @@ def main():
         "SP4": 1130
     }
 
-    final_neg_records = []
+    final_neg_records: List[Tuple[str, str]] = []
     for tf, share_size in neg_shares.items():
         path = os.path.join(NEG_DIR, NEG_FILES[tf])
         records = read_fasta(path)

@@ -5,7 +5,7 @@ and report the number of converted characters.
 """
 
 import os
-import sys
+from typing import Tuple
 
 FASTA_DIR = "data/processed/positive_datasets_fasta"
 FILES = [
@@ -14,7 +14,7 @@ FILES = [
     "SP4_downsampled_101bp.fasta",
 ]
 
-def capitalize_fasta_file(filepath):
+def capitalize_fasta_file(filepath: str) -> Tuple[int, int]:
     if not os.path.exists(filepath):
         print(f"Error: File not found {filepath}")
         return 0, 0
@@ -43,7 +43,7 @@ def capitalize_fasta_file(filepath):
 
     return total_seqs, converted_count
 
-def main():
+def main() -> None:
     print("=== FASTA Capitalization & Quality Standardisation ===")
     total_converted = 0
     total_files = 0

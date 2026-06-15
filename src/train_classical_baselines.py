@@ -21,40 +21,39 @@ Saves performance figures to figures/ directory.
 import os
 import sys
 import time
+from typing import List, Optional
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import label_binarize
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    confusion_matrix,
-    roc_curve,
-    auc,
-)
-
-# Classifiers
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import (
-    RandomForestClassifier,
     ExtraTreesClassifier,
     HistGradientBoostingClassifier,
+    RandomForestClassifier,
 )
-from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_curve,
+)
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.naive_bayes import BernoulliNB
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import label_binarize
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
 
 # Config
 DATA_DIR = "data/processed"
 FIG_DIR = "figures"
 CLASS_NAMES = ["SP1", "SP2", "SP4", "Negative"]
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> Optional[str]:
     """Search for target_file in absolute paths, Kaggle input, fallback dirs, or current directory."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
@@ -83,14 +82,14 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     """Search for the directory containing target_file in Kaggle input or local path."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:
         return os.path.dirname(resolved_path)
     return fallback
 
-def load_fasta(filepath):
+def load_fasta(filepath: str) -> List[str]:
     """Load DNA sequences from a FASTA file and convert to uppercase."""
     sequences = []
     if not os.path.exists(filepath):
@@ -102,7 +101,7 @@ def load_fasta(filepath):
                 sequences.append(line.upper())
     return sequences
 
-def main():
+def main() -> None:
     os.makedirs(FIG_DIR, exist_ok=True)
     print("=== TRAINING CLASSICAL ML BASELINES ===")
 

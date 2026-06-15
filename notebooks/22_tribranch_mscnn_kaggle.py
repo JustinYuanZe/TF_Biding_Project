@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script 19: G-CMAB Safe Core — Incremental Improvements on Script 18 Baseline
+Script 22: G-CMAB Tri-Branch msCNN — Multi-Scale CNN with Cross-Modal Attention
 Designed for: Kaggle GPU (1×T4 or 2×T4 via HuggingFace Accelerate)
 Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
 
@@ -9,11 +9,9 @@ BUILD PHILOSOPHY (Lessons from Scripts 15→18):
   - Each improvement here is an independent flag — test one at a time.
   - Keep Script 18 core (d_model=128, 1 cross-attn, weighted-CE, no pos-embed/EMA).
 
-SAFE IMPROVEMENTS (4 flags):
-  1. USE_STRIDED_CONV = True   — Strided Conv replaces MaxPool in shape CNN
-  2. USE_GROUPNORM   = True   — GroupNorm replaces BatchNorm (multi-GPU safe)
-  3. USE_LAYER_ATTN  = True   — Scalar-mix over multiple BERT layers (ELMo-style)
-  4. USE_MULTI_POOL  = True   — seq: mean‖max pooling, shape: K-Max(k=4) pooling
+ACTIVE IMPROVEMENTS (2 flags):
+  1. USE_GROUPNORM   = True   — GroupNorm replaces BatchNorm (multi-GPU safe)
+  2. USE_LAYER_ATTN  = True   — Scalar-mix over multiple BERT layers (ELMo-style)
 
 Multi-GPU via HuggingFace Accelerate (automatic, no code change needed for 1-GPU).
 """
@@ -53,11 +51,11 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import gc
-import copy
 import math
 import time
 import random
 import warnings
+import re
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
@@ -87,7 +85,6 @@ from sklearn.preprocessing import label_binarize
 # Use a custom import hook to force DNABERT-2 to fallback to standard PyTorch attention,
 # while allowing other components (like torch._dynamo or HF check_imports) to import Triton normally.
 import builtins
-import sys
 
 orig_import = builtins.__import__
 
@@ -128,7 +125,7 @@ if torch.cuda.is_available():
 # CELL 2: Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> str | None:
     """Search for target_file in absolute paths, Kaggle input, fallback dirs, or CWD."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
@@ -154,7 +151,7 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     """Search for the directory containing target_file in Kaggle input or local path."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:
@@ -283,7 +280,6 @@ DEVICE = accelerator.device
 
 # Redefine print globally to suppress non-main process logging in DDP/Multi-GPU
 if not accelerator.is_main_process:
-    import builtins
     builtins.print = lambda *args, **kwargs: None
 
 print(f"PyTorch version: {torch.__version__}")
@@ -310,7 +306,7 @@ print("=" * 60)
 # CELL 3: Data Loading (Sequences + DNAshape Features)
 # ═══════════════════════════════════════════════════════════════════════
 
-def load_fasta(filepath):
+def load_fasta(filepath: str) -> tuple[list[str], list[str]]:
     """Load DNA sequences and their headers from a FASTA file."""
     sequences = []
     headers = []
@@ -1066,7 +1062,6 @@ class TriBranchGCMABmsCNNClassifier(nn.Module):
 # CELL 8: Dataset & DataLoaders
 # ═══════════════════════════════════════════════════════════════════════
 
-import re as regex
 
 class TriBranchDataset(Dataset):
     """Dataset providing tokenized DNA sequences, DNAshape features, and sequence-derived bio-features."""
@@ -1076,7 +1071,7 @@ class TriBranchDataset(Dataset):
         self.shape_features = shape_features
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.g4_pattern = regex.compile(r'(G{3,}[ACGTN]{1,7}){3,}G{3,}', regex.IGNORECASE)
+        self.g4_pattern = re.compile(r'(G{3,}[ACGTN]{1,7}){3,}G{3,}', re.IGNORECASE)
         self.bio_features = self._precompute_bio_features()
 
     def _precompute_bio_features(self):
@@ -1300,7 +1295,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler,
                 criterion, accelerator_obj, cfg):
     if accelerator_obj.is_main_process:
         print("\n" + "=" * 60)
-        print("TRAINING -- G-CMAB Safe Core (Script 19)")
+        print("TRAINING -- G-CMAB msCNN (Script 22)")
         print("=" * 60)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -1434,7 +1429,7 @@ def full_evaluation(model, test_loader, class_names, accelerator_obj):
 
         report_path = os.path.join(cfg.OUTPUT_DIR, "classification_report.txt")
         with open(report_path, "w") as f:
-            f.write("CLASSIFICATION REPORT -- G-CMAB Safe Core (Script 19)\n")
+            f.write("CLASSIFICATION REPORT -- G-CMAB msCNN (Script 22)\n")
             f.write("=" * 60 + "\n")
             f.write(report_str)
         print(f"  -> Report saved: {report_path}")
@@ -1496,14 +1491,18 @@ def plot_training_curves(history, save_dir):
     ax1.plot(range(1, epochs+1), history["train_loss"], label="Train Loss", color="#2196F3", linewidth=2)
     ax1.plot(range(1, epochs+1), history["val_loss"], label="Val Loss", color="#FF5722", linewidth=2)
     ax1.set_title("Loss Convergence", fontsize=14, fontweight="bold")
-    ax1.set_xlabel("Epoch"); ax1.set_ylabel("Loss"); ax1.legend(fontsize=11)
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.legend(fontsize=11)
     ax1.grid(True, linestyle="--", alpha=0.4)
 
     ax2.plot(range(1, epochs+1), history["train_acc"], label="Train Acc", color="#4CAF50", linewidth=2)
     ax2.plot(range(1, epochs+1), history["val_acc"], label="Val Acc", color="#E91E63", linewidth=2)
     ax2.axhline(y=0.25, color="gray", linestyle="--", alpha=0.5, label="Random Guess")
     ax2.set_title("Accuracy Performance", fontsize=14, fontweight="bold")
-    ax2.set_xlabel("Epoch"); ax2.set_ylabel("Accuracy"); ax2.legend(fontsize=11)
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Accuracy")
+    ax2.legend(fontsize=11)
     ax2.grid(True, linestyle="--", alpha=0.4)
 
     plt.suptitle(f"{TITLE_PREFIX} -- Training Progress", fontsize=16, fontweight="bold", y=1.02)
@@ -1607,7 +1606,9 @@ def plot_per_class_metrics_bar(all_targets, all_preds, class_names, save_dir):
     ax.set_xticklabels([f"{cn}\n(n={s})" for cn, s in zip(class_names, support)])
     ax.set_ylabel("Score", fontsize=12)
     ax.set_title(f"Per-Class Performance -- {TITLE_PREFIX}", fontsize=14, fontweight="bold")
-    ax.set_ylim(0, 1.15); ax.legend(fontsize=11); ax.grid(True, linestyle="--", alpha=0.3, axis="y")
+    ax.set_ylim(0, 1.15)
+    ax.legend(fontsize=11)
+    ax.grid(True, linestyle="--", alpha=0.3, axis="y")
     plt.tight_layout()
     path = os.path.join(save_dir, "gcmab_mscnn_per_class_metrics.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
@@ -1668,10 +1669,7 @@ if accelerator.is_main_process:
     print("=" * 60)
     try:
         import shap
-        import matplotlib.pyplot as plt
         import seaborn as sns
-        import numpy as np
-        import re
         
         # Run predictions on test loader (main process only)
         model.eval()
@@ -1684,9 +1682,10 @@ if accelerator.is_main_process:
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
                 shape_features = batch["shape_features"].to(device)
+                bio_features = batch["bio_features"].to(device)
                 labels = batch["labels"].to(device)
-                
-                logits = model(input_ids, attention_mask, shape_features)
+
+                logits = model(input_ids, attention_mask, shape_features, bio_features)
                 preds = logits.argmax(dim=1)
                 
                 all_preds.extend(preds.cpu().numpy())

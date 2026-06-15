@@ -1,6 +1,11 @@
-# Co-authored DNAshape parameters lookup table
-# Format: pentamer: [MGW, ProT, roll1, roll2, twist1, twist2, EP]
-DNASHAPE_LOOKUP = {
+"""
+DNAshape parameters lookup table.
+Format: pentamer: [MGW, ProT, roll1, roll2, twist1, twist2, EP]
+"""
+
+from typing import Dict, List
+
+DNASHAPE_LOOKUP: Dict[str, List[float]] = {
     'AAAAA': [3.38, -16.51, -5.05, -5.09, 37.74, 38.01, -10.1],
     'AAAAC': [4.05, -14.47, -3.62, -4.8, 37.13, 36.95, -8.97],
     'AAAAG': [3.68, -14.68, -4.23, -6.47, 37.02, 37.18, -10.39],

@@ -1,10 +1,19 @@
+"""
+DNABERT-2 wrapper with pure-PyTorch flash attention replacement to circumvent Triton issues.
+"""
+
+import gc
 import os
 import sys
+from typing import Any, List, Optional, Union
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel, AutoConfig
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -14,7 +23,7 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig
 # versions (≥ 3.x) commonly found on Kaggle/Colab.
 # ──────────────────────────────────────────────────────────────────────
 
-def _pytorch_flash_attn_qkvpacked(qkv, bias=None, causal=False, softmax_scale=None):
+def _pytorch_flash_attn_qkvpacked(qkv: torch.Tensor, bias: Optional[torch.Tensor] = None, causal: bool = False, softmax_scale: Optional[float] = None) -> torch.Tensor:
     """
     Drop-in replacement for FlashAttnQKVPackedFunc.apply().
 
@@ -49,7 +58,7 @@ def _pytorch_flash_attn_qkvpacked(qkv, bias=None, causal=False, softmax_scale=No
     return out.transpose(1, 2).contiguous()  # (B, S, H, D)
 
 
-def _pytorch_flash_attn_kvpacked(q, kv, bias=None, causal=False, softmax_scale=None):
+def _pytorch_flash_attn_kvpacked(q: torch.Tensor, kv: torch.Tensor, bias: Optional[torch.Tensor] = None, causal: bool = False, softmax_scale: Optional[float] = None) -> torch.Tensor:
     """
     Drop-in replacement for FlashAttnKVPackedFunc.apply().
 
@@ -81,7 +90,7 @@ def _pytorch_flash_attn_kvpacked(q, kv, bias=None, causal=False, softmax_scale=N
     return out.transpose(1, 2).contiguous()
 
 
-def _pytorch_flash_attn_func(q, k, v, bias=None, causal=False, softmax_scale=None):
+def _pytorch_flash_attn_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: Optional[torch.Tensor] = None, causal: bool = False, softmax_scale: Optional[float] = None) -> torch.Tensor:
     """
     Drop-in replacement for FlashAttnFunc.apply().
     """
@@ -105,7 +114,7 @@ def _pytorch_flash_attn_func(q, k, v, bias=None, causal=False, softmax_scale=Non
     return out.transpose(1, 2).contiguous()
 
 
-def _patch_flash_attention():
+def _patch_flash_attention() -> None:
     """
     Monkey-patch ALL cached HuggingFace modules that reference DNABERT-2's
     flash_attn_triton functions so they use our pure-PyTorch replacements.
@@ -138,7 +147,7 @@ def _patch_flash_attention():
 # Device safety probe
 # ──────────────────────────────────────────────────────────────────────
 
-def _get_safe_device(requested_device=None):
+def _get_safe_device(requested_device: Optional[Union[str, torch.device]] = None) -> torch.device:
     """
     Determine a safe torch device.
     Probes CUDA with a tiny tensor to catch incompatible GPU architectures
@@ -164,7 +173,7 @@ def _get_safe_device(requested_device=None):
 # ──────────────────────────────────────────────────────────────────────
 
 class DNABERTWrapper:
-    def __init__(self, model_name="zhihan1996/DNABERT-2-117M", trust_remote_code=True, device=None):
+    def __init__(self, model_name: str = "zhihan1996/DNABERT-2-117M", trust_remote_code: bool = True, device: Optional[Union[str, torch.device]] = None) -> None:
         """
         Initialize the DNABERT-2 model and BPE tokenizer.
 
@@ -207,14 +216,12 @@ class DNABERTWrapper:
         if model is None:
             try:
                 print("  Trying Strategy 2 (empty init + state_dict reload)...")
-                from huggingface_hub import hf_hub_download
 
                 with torch.no_grad():
                     model = AutoModel.from_config(config, trust_remote_code=trust_remote_code)
 
                 try:
                     weight_file = hf_hub_download(repo_id=model_name, filename="model.safetensors")
-                    from safetensors.torch import load_file
                     state_dict = load_file(weight_file, device="cpu")
                 except Exception:
                     weight_file = hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
@@ -279,13 +286,12 @@ class DNABERTWrapper:
         self.model.eval()
         print(f"DNABERT-2 loaded successfully on {self.device}.")
 
-    def get_embeddings(self, sequences, batch_size=64, max_length=105, dtype=np.float16):
+    def get_embeddings(self, sequences: List[str], batch_size: int = 64, max_length: int = 105, dtype: Any = np.float16) -> np.ndarray:
         """
         Extract token-level embeddings of shape (n_samples, seq_len, 768) from DNA sequences.
         Ensures a fixed sequence length by using padding='max_length'.
         Uses float16 by default to save 50% RAM/VRAM memory.
         """
-        import gc
         embeddings_list = []
 
         with torch.no_grad():
@@ -315,7 +321,7 @@ class DNABERTWrapper:
             torch.cuda.empty_cache()
         return res
 
-    def get_cls_embeddings(self, sequences, batch_size=64):
+    def get_cls_embeddings(self, sequences: List[str], batch_size: int = 64) -> np.ndarray:
         """
         Extract CLS token embeddings of shape (n_samples, 768) from DNA sequences.
         Useful for simple classification or visualization (t-SNE).

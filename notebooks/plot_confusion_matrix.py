@@ -1,3 +1,7 @@
+"""
+Auto-refactored script: plot_confusion_matrix.py
+Refactored to align with project standards.
+"""
 import os
 import torch
 import numpy as np

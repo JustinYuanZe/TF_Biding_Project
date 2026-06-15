@@ -1,5 +1,5 @@
 """
-STEP 4: Downsampling — Multi-class Balancing
+STEP 4: Downsampling ?" Multi-class Balancing
 
 Inputs:
   - data/processed/filtered_exclusive_101bp/{TF}_exclusive_101bp.bed  (3-col: chrom, start, end)
@@ -18,6 +18,7 @@ Workflow:
 """
 
 import os
+
 import numpy as np
 import pandas as pd
 
@@ -32,7 +33,7 @@ COLS_NARROW = ['chrom', 'start', 'end', 'name', 'score', 'strand',
 WINDOW_HALF = 50
 
 
-def load_exclusive(tf):
+def load_exclusive(tf: str) -> pd.DataFrame:
     """Load 3-column exclusive BED (output of overlap removal)."""
     path = os.path.join(EXCLUSIVE_DIR, f"{tf}_exclusive_101bp.bed")
     df = pd.read_csv(path, sep='\t', header=None, names=['chrom', 'start', 'end'])
@@ -40,7 +41,7 @@ def load_exclusive(tf):
     return df
 
 
-def load_filtered(tf):
+def load_filtered(tf: str) -> pd.DataFrame:
     """Load 10-column filtered narrowPeak BED."""
     path = os.path.join(FILTERED_DIR, f"{tf}_filtered.bed")
     df = pd.read_csv(path, sep='\t', header=None, names=COLS_NARROW)
@@ -48,7 +49,7 @@ def load_filtered(tf):
     return df
 
 
-def join_qval(exclusive_df, filtered_df):
+def join_qval(exclusive_df: pd.DataFrame, filtered_df: pd.DataFrame) -> pd.DataFrame:
     """
     Match exclusive peaks back to their filtered source to retrieve qval.
     
@@ -84,7 +85,7 @@ def join_qval(exclusive_df, filtered_df):
     return merged
 
 
-def main():
+def main() -> None:
     print("=" * 70)
     print("STEP 4: DOWNSAMPLING (SP2 baseline, highest qval first)")
     print("=" * 70)
@@ -180,4 +181,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main()()

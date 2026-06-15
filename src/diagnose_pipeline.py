@@ -6,20 +6,21 @@ when the majority-class baseline is 75%.
 """
 
 import os
-import sys
 import random
-import numpy as np
 from collections import Counter
+from typing import Dict, List, Set, Tuple
+
+import numpy as np
 
 random.seed(42)
 
 DATA_DIR = "data/processed"
 
-def read_fasta(path):
-    records = []
+def read_fasta(path: str) -> List[Tuple[str, str]]:
+    records: List[Tuple[str, str]] = []
     with open(path, 'r') as f:
-        header = ''
-        seq = []
+        header: str = ''
+        seq: List[str] = []
         for line in f:
             line = line.strip()
             if line.startswith('>'):
@@ -33,15 +34,15 @@ def read_fasta(path):
             records.append((header, ''.join(seq)))
     return records
 
-def gc_content(seq):
-    gc = seq.count('G') + seq.count('C')
+def gc_content(seq: str) -> float:
+    gc: int = seq.count('G') + seq.count('C')
     return gc / len(seq) * 100
 
-def get_kmers(seq, k=6):
+def get_kmers(seq: str, k: int = 6) -> Set[str]:
     return set(seq[i:i+k] for i in range(len(seq)-k+1))
 
-def get_kmer_freq(seq, k=6):
-    kmers = Counter()
+def get_kmer_freq(seq: str, k: int = 6) -> Counter[str]:
+    kmers: Counter[str] = Counter()
     for i in range(len(seq)-k+1):
         kmers[seq[i:i+k]] += 1
     return kmers
@@ -135,14 +136,14 @@ print("\n" + "=" * 70)
 print("5. DINUCLEOTIDE FREQUENCY COMPARISON")
 print("=" * 70)
 
-def dinuc_freq(sequences):
-    counts = Counter()
-    total = 0
+def dinuc_freq(sequences: List[str]) -> Dict[str, float]:
+    counts: Counter[str] = Counter()
+    total: int = 0
     for s in sequences:
         for i in range(len(s) - 1):
             counts[s[i:i+2]] += 1
             total += 1
-    return {k: v/total for k, v in counts.items()}
+    return {k: v / total for k, v in counts.items()}
 
 pos_seqs = [s for tf in ['sp1','sp2','sp4'] for h, s in pos_all[tf]]
 neg_seqs = [s for h, s in neg_recs]

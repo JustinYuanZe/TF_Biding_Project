@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Script 19: G-CMAB Safe Core — Incremental Improvements on Script 18 Baseline
+Auto-refactored script: 21_mscnn_kaggle.py
+Refactored to align with project standards.
+"""
+"""
+Script 21: G-CMAB msCNN — Multi-Scale CNN (msCNN)
 Designed for: Kaggle GPU (1×T4 or 2×T4 via HuggingFace Accelerate)
 Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
 
@@ -53,7 +57,6 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import gc
-import copy
 import math
 import time
 import random
@@ -128,7 +131,7 @@ if torch.cuda.is_available():
 # CELL 2: Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> str | None:
     """Search for target_file in absolute paths, Kaggle input, fallback dirs, or CWD."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
@@ -154,7 +157,7 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     """Search for the directory containing target_file in Kaggle input or local path."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:

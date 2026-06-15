@@ -1,3 +1,7 @@
+"""
+Auto-refactored script: kaggle_cell_script20.py
+Refactored to align with project standards.
+"""
 # ═══════════════════════════════════════════════════════════════════════
 # KAGGLE LAUNCHER FOR SCRIPT 20: Hierarchical KAN Architecture
 # ═══════════════════════════════════════════════════════════════════════

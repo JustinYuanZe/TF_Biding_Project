@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Auto-refactored script: 18_simplified_crossmodal_kaggle.py
+Refactored to align with project standards.
+"""
+"""
 Script 18: Simplified Cross-Modal Attention — Restoring Script 14 Core + Bug Fixes
 Designed for: Kaggle GPU (T4/P100)
 Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
@@ -43,20 +47,15 @@ install_packages()
 # ═══════════════════════════════════════════════════════════════════════
 
 import gc
-import copy
 import math
 import time
 import random
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-from huggingface_hub.utils import disable_progress_bars
-disable_progress_bars()
-
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -80,6 +79,12 @@ from sklearn.preprocessing import label_binarize
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from tqdm import tqdm
 
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
+
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -90,7 +95,7 @@ if torch.cuda.is_available():
 # CELL 2: Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> str | None:
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
     if os.path.exists("/kaggle/input"):
@@ -111,7 +116,7 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     resolved_path = find_file(target_file, fallback)
     if resolved_path:
         return os.path.dirname(resolved_path)

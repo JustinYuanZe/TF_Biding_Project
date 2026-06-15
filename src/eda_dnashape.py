@@ -1,23 +1,30 @@
+"""
+Exploratory Data Analysis for DNAshape features.
+Calculates global descriptive statistics and visualizes distributions
+and correlations of DNAshape features across positive and negative datasets.
+"""
+
 import os
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
-def calculate_skew(x):
+def calculate_skew(x: np.ndarray) -> float:
     mean = np.mean(x)
     std = np.std(x)
     if std == 0:
-        return 0
-    return np.mean((x - mean) ** 3) / (std ** 3)
+        return 0.0
+    return float(np.mean((x - mean) ** 3) / (std ** 3))
 
-def calculate_kurtosis(x):
+def calculate_kurtosis(x: np.ndarray) -> float:
     mean = np.mean(x)
     std = np.std(x)
     if std == 0:
-        return 0
-    return np.mean((x - mean) ** 4) / (std ** 4) - 3
+        return 0.0
+    return float(np.mean((x - mean) ** 4) / (std ** 4) - 3)
 
-def to_markdown_manual(df):
+def to_markdown_manual(df: pd.DataFrame) -> str:
     cols = df.columns
     header = "| " + " | ".join(cols) + " |"
     separator = "| " + " | ".join(["---"] * len(cols)) + " |"
@@ -34,7 +41,7 @@ def to_markdown_manual(df):
         rows.append(row)
     return "\n".join([header, separator] + rows)
 
-def perform_eda():
+def perform_eda() -> None:
     data_dir = r"data\processed"
     fig_dir = r"figures"
     os.makedirs(fig_dir, exist_ok=True)

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Auto-refactored script: 24_binary_dnabert2_finetune_kaggle.py
+Refactored to align with project standards.
+"""
+"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  DNABERT-2 Fine-Tuning — End-to-End Training Script                ║
 ║  Designed for: Kaggle GPU (T4/P100) or Google Colab                ║
@@ -94,6 +98,8 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn

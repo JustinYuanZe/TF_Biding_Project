@@ -1,17 +1,23 @@
+"""
+Script to train the Multi-Scale CNN using pre-extracted DNABERT-2 embeddings.
+"""
+
+import argparse
 import os
 import sys
-import argparse
+
 import numpy as np
 import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
 
 # Fix import path for direct script execution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
 from src.mcnn_model import MultiScaleCNN
-from src.train import DNAEmbeddingDataset, train_model, evaluate_model, plot_curves
+from src.train import DNAEmbeddingDataset, evaluate_model, plot_curves, train_model
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Train Multi-Scale CNN on top of saved DNABERT-2 embeddings")
     parser.add_argument("--embeddings_path", type=str, default="data/processed/dnabert_embeddings.npy", help="Path to embeddings npy file")
     parser.add_argument("--labels_path", type=str, default="data/processed/dnabert_labels.npy", help="Path to labels npy file")

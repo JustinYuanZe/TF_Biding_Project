@@ -13,23 +13,24 @@ Output: data/processed/negative_dinuc_shuffled/SP{1,2,4}_dinuc_shuffled.fasta
 """
 
 import os
-import sys
 import random
-from collections import defaultdict, Counter
+import sys
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================
 # 1. Altschul-Erickson Dinucleotide Shuffle
 # ============================================================
 
-def count_dinucleotides(seq):
+def count_dinucleotides(seq: str) -> Counter:
     """Count all dinucleotide frequencies in a sequence."""
-    counts = Counter()
+    counts: Counter = Counter()
     for i in range(len(seq) - 1):
         counts[seq[i:i+2]] += 1
     return counts
 
 
-def dinucleotide_shuffle(seq, rng=None):
+def dinucleotide_shuffle(seq: str, rng: Optional[random.Random] = None) -> str:
     """
     Shuffle a DNA sequence preserving exact dinucleotide frequencies.
     
@@ -50,7 +51,7 @@ def dinucleotide_shuffle(seq, rng=None):
         return seq
 
     # Build outgoing edge lists for each node (in original order)
-    edges = defaultdict(list)
+    edges: Dict[str, List[str]] = defaultdict(list)
     for i in range(n - 1):
         edges[seq[i]].append(seq[i + 1])
 
@@ -85,7 +86,7 @@ def dinucleotide_shuffle(seq, rng=None):
 COMPLEMENT = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N'}
 
 
-def reverse_complement(seq):
+def reverse_complement(seq: str) -> str:
     """
     Generate the reverse complement of a DNA sequence.
     Step 1: Complement each base (A<->T, C<->G)
@@ -99,12 +100,12 @@ def reverse_complement(seq):
 # I/O Helpers
 # ============================================================
 
-def read_fasta(filepath):
+def read_fasta(filepath: str) -> List[Tuple[str, str]]:
     """Parse a FASTA file into list of (header, sequence) tuples."""
     records = []
     with open(filepath, 'r') as f:
         header = ""
-        seq_parts = []
+        seq_parts: List[str] = []
         for line in f:
             line = line.strip()
             if line.startswith('>'):
@@ -119,7 +120,7 @@ def read_fasta(filepath):
     return records
 
 
-def write_fasta(filepath, records):
+def write_fasta(filepath: str, records: List[Tuple[str, str]]) -> None:
     """Write list of (header, sequence) tuples to a FASTA file."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, 'w') as f:
@@ -127,13 +128,13 @@ def write_fasta(filepath, records):
             f.write(f"{header}\n{seq}\n")
 
 
-def gc_content(seq):
+def gc_content(seq: str) -> float:
     """Calculate GC content as a percentage."""
     gc = seq.count('G') + seq.count('C')
     return (gc / len(seq) * 100) if len(seq) > 0 else 0.0
 
 
-def mono_freqs(seq):
+def mono_freqs(seq: str) -> Dict[str, float]:
     """Calculate mononucleotide frequencies."""
     c = Counter(seq)
     total = len(seq)
@@ -144,7 +145,7 @@ def mono_freqs(seq):
 # Analysis & Reporting
 # ============================================================
 
-def analyze_dinuc_preservation(original_seqs, shuffled_seqs, label, rng):
+def analyze_dinuc_preservation(original_seqs: List[Tuple[str, str]], shuffled_seqs: List[Tuple[str, str]], label: str, rng: random.Random) -> None:
     """
     Verify that dinucleotide frequencies are preserved after shuffling.
     Also report GC content, mono-nucleotide frequencies, and random samples.
@@ -154,12 +155,12 @@ def analyze_dinuc_preservation(original_seqs, shuffled_seqs, label, rng):
     print(f"{'='*70}")
 
     # Aggregate dinucleotide counts across ALL sequences
-    orig_dinuc_total = Counter()
-    shuf_dinuc_total = Counter()
-    orig_mono_total = Counter()
-    shuf_mono_total = Counter()
-    orig_gc_values = []
-    shuf_gc_values = []
+    orig_dinuc_total: Counter = Counter()
+    shuf_dinuc_total: Counter = Counter()
+    orig_mono_total: Counter = Counter()
+    shuf_mono_total: Counter = Counter()
+    orig_gc_values: List[float] = []
+    shuf_gc_values: List[float] = []
 
     mismatches = 0
 
@@ -235,7 +236,7 @@ def analyze_dinuc_preservation(original_seqs, shuffled_seqs, label, rng):
         print(f"    Top dinucs (original): {di_str}")
 
 
-def analyze_revcomp(original_seqs, revcomp_seqs, label, rng):
+def analyze_revcomp(original_seqs: List[Tuple[str, str]], revcomp_seqs: List[Tuple[str, str]], label: str, rng: random.Random) -> None:
     """Report on reverse complement generation."""
     print(f"\n{'='*70}")
     print(f"  REVERSE COMPLEMENT REPORT: {label}")
@@ -267,8 +268,8 @@ def analyze_revcomp(original_seqs, revcomp_seqs, label, rng):
     print(f"    (GC content is mathematically invariant under reverse complement)")
 
     # Show A<->T and C<->G swap in aggregate
-    orig_mono = Counter()
-    rc_mono = Counter()
+    orig_mono: Counter = Counter()
+    rc_mono: Counter = Counter()
     for _, s in original_seqs:
         orig_mono += Counter(s)
     for _, s in revcomp_seqs:
@@ -309,7 +310,7 @@ def analyze_revcomp(original_seqs, revcomp_seqs, label, rng):
 # Main
 # ============================================================
 
-def main():
+def main() -> None:
     random.seed(42)
     rng = random.Random(42)
 

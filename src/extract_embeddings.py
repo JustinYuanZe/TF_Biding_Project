@@ -1,16 +1,21 @@
+"""
+Extract DNABERT-2 embeddings for the TF binding dataset.
+"""
+
+import argparse
 import os
 import sys
-import argparse
+from typing import List
+
 import numpy as np
-import torch
 
 # Fix import path for direct script execution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.dnabert_wrapper import DNABERTWrapper
 
-def load_fasta(path):
+def load_fasta(path: str) -> List[str]:
     """Load sequences from a FASTA file."""
-    seqs = []
+    seqs: List[str] = []
     if not os.path.exists(path):
         raise FileNotFoundError(f"File not found: {path}")
     with open(path, 'r') as f:
@@ -20,7 +25,7 @@ def load_fasta(path):
                 seqs.append(line.upper())
     return seqs
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Extract DNABERT-2 embeddings and save to disk as NumPy tensors")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for extraction")
     parser.add_argument("--max_length", type=int, default=105, help="Max sequence length")

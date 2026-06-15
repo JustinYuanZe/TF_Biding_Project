@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Script 19: G-CMAB Safe Core — Incremental Improvements on Script 18 Baseline
+Auto-refactored script: 23_binary_tribranch_kaggle.py
+Refactored to align with project standards.
+"""
+"""
+Script 23: Binary G-CMAB Tri-Branch msCNN — Binary SP_Positive/Negative Classification
 Designed for: Kaggle GPU (1×T4 or 2×T4 via HuggingFace Accelerate)
-Task: 4-class SP1/SP2/SP4/Negative TF-binding classification
+Task: Binary SP_Positive/Negative TF-binding classification
 
 BUILD PHILOSOPHY (Lessons from Scripts 15→18):
   - Script 16 collapsed to 25% by changing 11 things at once.
@@ -53,7 +57,6 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import gc
-import copy
 import math
 import time
 import random
@@ -87,7 +90,6 @@ from sklearn.preprocessing import label_binarize
 # Use a custom import hook to force DNABERT-2 to fallback to standard PyTorch attention,
 # while allowing other components (like torch._dynamo or HF check_imports) to import Triton normally.
 import builtins
-import sys
 
 orig_import = builtins.__import__
 
@@ -128,7 +130,7 @@ if torch.cuda.is_available():
 # CELL 2: Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-def find_file(filename, fallback_dir="data/processed"):
+def find_file(filename: str, fallback_dir: str = "data/processed") -> str | None:
     """Search for target_file in absolute paths, Kaggle input, fallback dirs, or CWD."""
     if os.path.isabs(filename) and os.path.exists(filename):
         return filename
@@ -154,7 +156,7 @@ def find_file(filename, fallback_dir="data/processed"):
     return None
 
 
-def auto_detect_dir(target_file, fallback="data/processed"):
+def auto_detect_dir(target_file: str, fallback: str = "data/processed") -> str:
     """Search for the directory containing target_file in Kaggle input or local path."""
     resolved_path = find_file(target_file, fallback)
     if resolved_path:
@@ -163,7 +165,7 @@ def auto_detect_dir(target_file, fallback="data/processed"):
 
 
 class Config:
-    """Script 22: G-CMAB msCNN config."""
+    """Script 23: Binary G-CMAB Tri-Branch msCNN config."""
 
     # ── Paths ──
     FASTA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")

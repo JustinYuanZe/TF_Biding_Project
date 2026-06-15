@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Auto-refactored script: 09_dnabert2_mcnn_kaggle.py
+Refactored to align with project standards.
+"""
+"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  DNABERT-2 + Multi-Scale CNN (mCNN) — End-to-End Training Script   ║
 ║  Designed for: Kaggle GPU (T4/P100) or Google Colab                ║
@@ -69,12 +73,6 @@ import os
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-from huggingface_hub.utils import disable_progress_bars
-disable_progress_bars()
-
 import gc
 import time
 import random
@@ -82,6 +80,8 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -103,6 +103,12 @@ from sklearn.metrics import (
 from sklearn.preprocessing import label_binarize
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from tqdm import tqdm
+
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+from huggingface_hub.utils import disable_progress_bars
+disable_progress_bars()
 
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")

@@ -1,26 +1,32 @@
+"""
+Core training, evaluation, and plotting logic for PyTorch models.
+"""
+
 import os
 import time
-import numpy as np
+from typing import Any, Dict, List, Tuple, Union
+
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import (
+    auc,
+    average_precision_score,
     classification_report,
     confusion_matrix,
-    roc_curve,
-    auc,
     precision_recall_curve,
-    average_precision_score,
+    roc_curve,
 )
+from torch.utils.data import DataLoader, Dataset
 
 class DNAEmbeddingDataset(Dataset):
     """
     Custom PyTorch Dataset for loading pre-extracted DNABERT-2 embeddings and labels.
     Uses memory-sharing (torch.from_numpy) to prevent duplicating large arrays in RAM.
     """
-    def __init__(self, embeddings, labels):
+    def __init__(self, embeddings: Union[np.ndarray, torch.Tensor], labels: Union[np.ndarray, torch.Tensor]) -> None:
         if isinstance(embeddings, np.ndarray):
             self.embeddings = torch.from_numpy(embeddings)
         else:
@@ -31,15 +37,15 @@ class DNAEmbeddingDataset(Dataset):
         else:
             self.labels = labels
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         # Convert to float32/long dynamically during batch collation
         return self.embeddings[idx].to(torch.float32), self.labels[idx].to(torch.long)
 
 
-def train_model(model, train_loader, val_loader, epochs=15, lr=0.001, device='cuda', output_dir='models'):
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, epochs: int = 15, lr: float = 0.001, device: str = 'cuda', output_dir: str = 'models') -> Dict[str, List[float]]:
     """
     Train the mCNN model and track loss/accuracy curves.
     """
@@ -137,7 +143,7 @@ def train_model(model, train_loader, val_loader, epochs=15, lr=0.001, device='cu
     return history
 
 
-def plot_curves(history, save_dir='figures'):
+def plot_curves(history: Dict[str, List[float]], save_dir: str = 'figures') -> None:
     """
     Plot and save training/validation Loss and Accuracy curves.
     """
@@ -170,7 +176,7 @@ def plot_curves(history, save_dir='figures'):
     print(f"Training curves saved to: {save_dir}/mcnn_training_curves.png")
 
 
-def evaluate_model(model, val_loader, class_names, device='cuda', save_dir='figures'):
+def evaluate_model(model: nn.Module, val_loader: DataLoader, class_names: List[str], device: str = 'cuda', save_dir: str = 'figures') -> None:
     """
     Generate ROC curves, Precision-Recall curves, and Confusion Matrix.
     """

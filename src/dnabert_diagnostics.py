@@ -1,17 +1,23 @@
+"""
+Diagnostic tools for analyzing DNABERT-2 representations and embeddings.
+"""
+
 import os
 import sys
-import torch
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics.pairwise import cosine_similarity
+import torch
 
 # Fix import path for direct execution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.dnabert_wrapper import DNABERTWrapper
 
-def run_dnabert_diagnostics(sequences_dict, device='cuda', save_dir='figures'):
+
+def run_dnabert_diagnostics(sequences_dict: dict, device: str = 'cuda', save_dir: str = 'figures') -> np.ndarray:
     """
     Run diagnostic checks on DNABERT-2 embeddings:
     1. Extract CLS embeddings for a subset of each class.
