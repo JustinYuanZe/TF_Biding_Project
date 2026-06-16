@@ -1273,15 +1273,23 @@ if accelerator.is_main_process:
         unwrapped_model.eval()
         device = accelerator.device
 
-        # 1) Predictions to bucket samples
-        sh_preds, sh_targets = [], []
+        # 1) Predictions + per-sample probabilities to bucket samples.
+        #    METHODOLOGICAL FIX: confidently-correct samples saturate the sigmoid,
+        #    so GradientExplainer (grad x (input-baseline)) returns ~0 for every
+        #    modality and the plots come out flat. We instead explain samples NEAR
+        #    THE DECISION BOUNDARY (prob closest to 0.5), where gradients are
+        #    informative, and only fall back to confident-correct if too few exist.
+        sh_preds, sh_targets, sh_probs = [], [], []
         with torch.no_grad():
             for batch in test_loader:
                 logits = unwrapped_model(batch["input_ids"].to(device), batch["attention_mask"].to(device),
                                          batch["shape_features"].to(device), batch["bio_features"].to(device))
+                logits = logits.float().reshape(-1)
+                sh_probs.extend(torch.sigmoid(logits).cpu().numpy())
                 sh_preds.extend((logits > 0).long().cpu().numpy())
                 sh_targets.extend(batch["labels"].cpu().numpy())
         sh_preds, sh_targets = np.array(sh_preds), np.array(sh_targets)
+        sh_probs = np.array(sh_probs)
 
         idx_TP = [i for i in range(len(sh_targets)) if sh_targets[i] == 1 and sh_preds[i] == 1]
         idx_TN = [i for i in range(len(sh_targets)) if sh_targets[i] == 0 and sh_preds[i] == 0]
@@ -1289,12 +1297,28 @@ if accelerator.is_main_process:
         idx_FP = [i for i in range(len(sh_targets)) if sh_targets[i] == 0 and sh_preds[i] == 1]
         print(f"  Buckets: TP={len(idx_TP)}, TN={len(idx_TN)}, FN={len(idx_FN)}, FP={len(idx_FP)}")
 
-        subset_A_indices = idx_TP                         # correctly called SP_Positive
-        subset_B_indices = idx_TN if len(idx_TN) >= 3 else idx_FN
-        label_A, label_B = "Correct SP_Positive", ("Correct Negative" if len(idx_TN) >= 3 else "False Negative")
+        n_explain = cfg.SHAP_NUM_EXPLAIN
+        # Near-boundary contrastive grouping: rank all samples by |prob - 0.5|
+        # (ascending), then split into true-positive vs true-negative groups.
+        boundary_order = np.argsort(np.abs(sh_probs - 0.5))
+        nb_pos = [int(i) for i in boundary_order if sh_targets[i] == 1][:n_explain]
+        nb_neg = [int(i) for i in boundary_order if sh_targets[i] == 0][:n_explain]
+
+        if len(nb_pos) >= 3 and len(nb_neg) >= 3:
+            subset_A_indices, subset_B_indices = nb_pos, nb_neg
+            label_A, label_B = "Near-boundary SP_Positive", "Near-boundary Negative"
+            print(f"  Near-boundary selection: A(pos)={len(nb_pos)}, B(neg)={len(nb_neg)} "
+                  f"| prob range A=[{sh_probs[nb_pos].min():.3f},{sh_probs[nb_pos].max():.3f}], "
+                  f"B=[{sh_probs[nb_neg].min():.3f},{sh_probs[nb_neg].max():.3f}]")
+        else:
+            # Fallback: original confident-correct selection (kept verbatim).
+            subset_A_indices = idx_TP                         # correctly called SP_Positive
+            subset_B_indices = idx_TN if len(idx_TN) >= 3 else idx_FN
+            label_A, label_B = "Correct SP_Positive", ("Correct Negative" if len(idx_TN) >= 3 else "False Negative")
+            print(f"  Too few near-boundary samples (pos={len(nb_pos)}, neg={len(nb_neg)}); "
+                  f"falling back to confident-correct subsets.")
 
         if len(subset_A_indices) >= 3 and len(subset_B_indices) >= 3:
-            n_explain = cfg.SHAP_NUM_EXPLAIN
             explain_A = subset_A_indices[:n_explain]
             explain_B = subset_B_indices[:n_explain]
 
@@ -1347,6 +1371,19 @@ if accelerator.is_main_process:
 
             seq_shap_A, shape_shap_A, bio_shap_A = unpack(sv_A)
             seq_shap_B, shape_shap_B, bio_shap_B = unpack(sv_B)
+
+            # ── Saturation guard: warn if any modality's attributions are ~0 ──
+            SHAP_DEGEN_TOL = 1e-6
+            for mod_name, arr_A, arr_B in [
+                ("Sequence", seq_shap_A, seq_shap_B),
+                ("DNAshape", shape_shap_A, shape_shap_B),
+                ("Bio", bio_shap_A, bio_shap_B),
+            ]:
+                max_abs = max(np.abs(arr_A).max(), np.abs(arr_B).max())
+                if max_abs < SHAP_DEGEN_TOL:
+                    print(f"  WARNING: {mod_name} SHAP attributions are degenerate "
+                          f"(max|SHAP|={max_abs:.2e} < {SHAP_DEGEN_TOL:.0e}). Likely sigmoid "
+                          f"saturation -> gradients vanished; this plot is NOT informative.")
 
             # ── PLOT 1: DNAshape feature importance (5 params) ──
             imp_shape_A = np.abs(shape_shap_A).sum(axis=2).mean(axis=0)
