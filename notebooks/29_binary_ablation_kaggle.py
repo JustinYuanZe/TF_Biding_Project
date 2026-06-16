@@ -777,19 +777,44 @@ def run_shap(unwrapped, flags, out_dir, prefix, device):
         unwrapped.eval()
         use_shape, use_bio = flags["use_shape"], flags["use_bio"]
 
-        sp_preds, sp_tgts = [], []
+        # METHODOLOGICAL FIX: confidently-correct samples saturate the sigmoid, so
+        # GradientExplainer (grad x (input-baseline)) returns ~0 for every modality
+        # and the plots come out flat. We instead explain samples NEAR THE DECISION
+        # BOUNDARY (prob closest to 0.5), splitting near-boundary samples by label
+        # for the A-vs-B bars; fall back to confident-correct only if too few exist.
+        sp_preds, sp_tgts, sp_probs = [], [], []
         loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
         with torch.no_grad():
             for b in loader:
                 lg = unwrapped(b["input_ids"].to(device), b["attention_mask"].to(device),
                                b["shape_features"].to(device), b["bio_features"].to(device))
+                lg = lg.float().reshape(-1)
+                sp_probs.extend(torch.sigmoid(lg).cpu().numpy())
                 sp_preds.extend((lg > 0).long().cpu().numpy()); sp_tgts.extend(b["labels"].numpy())
         sp_preds, sp_tgts = np.array(sp_preds), np.array(sp_tgts)
+        sp_probs = np.array(sp_probs)
         idx_TP = [i for i in range(len(sp_tgts)) if sp_tgts[i] == 1 and sp_preds[i] == 1]
         idx_TN = [i for i in range(len(sp_tgts)) if sp_tgts[i] == 0 and sp_preds[i] == 0]
-        if len(idx_TP) < 3 or len(idx_TN) < 3:
-            print(f"    [{prefix}] SHAP skipped (TP={len(idx_TP)}, TN={len(idx_TN)})"); return
-        A, B = idx_TP[:cfg.SHAP_NUM_EXPLAIN], idx_TN[:cfg.SHAP_NUM_EXPLAIN]
+
+        # Near-boundary contrastive grouping: rank by |prob - 0.5| then split by label.
+        boundary_order = np.argsort(np.abs(sp_probs - 0.5))
+        nb_pos = [int(i) for i in boundary_order if sp_tgts[i] == 1][:cfg.SHAP_NUM_EXPLAIN]
+        nb_neg = [int(i) for i in boundary_order if sp_tgts[i] == 0][:cfg.SHAP_NUM_EXPLAIN]
+        if len(nb_pos) >= 3 and len(nb_neg) >= 3:
+            A, B = nb_pos, nb_neg
+            label_A, label_B = "Near-boundary SP_Positive", "Near-boundary Negative"
+            print(f"    [{prefix}] Near-boundary SHAP: A(pos)={len(A)}, B(neg)={len(B)} "
+                  f"| prob A=[{sp_probs[A].min():.3f},{sp_probs[A].max():.3f}], "
+                  f"B=[{sp_probs[B].min():.3f},{sp_probs[B].max():.3f}]")
+        elif len(idx_TP) >= 3 and len(idx_TN) >= 3:
+            # Fallback: original confident-correct selection.
+            A, B = idx_TP[:cfg.SHAP_NUM_EXPLAIN], idx_TN[:cfg.SHAP_NUM_EXPLAIN]
+            label_A, label_B = "Correct SP_Positive", "Correct Negative"
+            print(f"    [{prefix}] Too few near-boundary (pos={len(nb_pos)}, neg={len(nb_neg)}); "
+                  f"falling back to confident-correct subsets.")
+        else:
+            print(f"    [{prefix}] SHAP skipped (TP={len(idx_TP)}, TN={len(idx_TN)}, "
+                  f"nb_pos={len(nb_pos)}, nb_neg={len(nb_neg)})"); return
 
         def stack(indices, field):
             return torch.stack([test_dataset[i][field] for i in indices]).to(device)
@@ -860,14 +885,24 @@ def run_shap(unwrapped, flags, out_dir, prefix, device):
         seq_A = grab(sv_A, "seq", 3); seq_B = grab(sv_B, "seq", 3)
         W = cfg.SHAP_WINDOW
 
+        # Saturation guard: warn if any active modality's attributions are ~0.
+        SHAP_DEGEN_TOL = 1e-6
+        for m, nd in [("seq", 3), ("shape", 3), ("bio", 2)]:
+            if m in order:
+                max_abs = max(np.abs(grab(sv_A, m, nd)).max(), np.abs(grab(sv_B, m, nd)).max())
+                if max_abs < SHAP_DEGEN_TOL:
+                    print(f"    [{prefix}] WARNING: {m} SHAP attributions are degenerate "
+                          f"(max|SHAP|={max_abs:.2e} < {SHAP_DEGEN_TOL:.0e}). Likely sigmoid "
+                          f"saturation -> gradients vanished; this plot is NOT informative.")
+
         # DNAshape bar
         if use_shape:
             shp_A = grab(sv_A, "shape", 3); shp_B = grab(sv_B, "shape", 3)
             iA = np.abs(shp_A).sum(axis=2).mean(axis=0); iB = np.abs(shp_B).sum(axis=2).mean(axis=0)
             feats = ["MGW", "ProT", "Roll", "HelT", "EP"]; x = np.arange(5); w = 0.35
             plt.figure(figsize=(8, 5))
-            plt.bar(x - w/2, iA, w, label="Correct SP_Positive", color="#4CAF50")
-            plt.bar(x + w/2, iB, w, label="Correct Negative", color="#F44336")
+            plt.bar(x - w/2, iA, w, label=label_A, color="#4CAF50")
+            plt.bar(x + w/2, iB, w, label=label_B, color="#F44336")
             plt.xticks(x, feats); plt.ylabel("Mean |SHAP| (Σ positions)"); plt.title(f"{prefix} DNAshape importance")
             plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
             plt.savefig(os.path.join(out_dir, f"{prefix}_shap_dnashape_bar.png"), dpi=130); plt.close()
@@ -878,8 +913,8 @@ def run_shap(unwrapped, flags, out_dir, prefix, device):
             iA = np.abs(bio_A).mean(axis=0); iB = np.abs(bio_B).mean(axis=0)
             bf = ["CpG O/E", "GC", "G4"]; x = np.arange(3); w = 0.35
             plt.figure(figsize=(7, 5))
-            plt.bar(x - w/2, iA, w, label="Correct SP_Positive", color="#4CAF50")
-            plt.bar(x + w/2, iB, w, label="Correct Negative", color="#F44336")
+            plt.bar(x - w/2, iA, w, label=label_A, color="#4CAF50")
+            plt.bar(x + w/2, iB, w, label=label_B, color="#F44336")
             plt.xticks(x, bf); plt.ylabel("Mean |SHAP|"); plt.title(f"{prefix} Bio-feature importance")
             plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
             plt.savefig(os.path.join(out_dir, f"{prefix}_shap_bio_bar.png"), dpi=130); plt.close()
@@ -896,8 +931,8 @@ def run_shap(unwrapped, flags, out_dir, prefix, device):
         labels_m = [m.capitalize() for m in order]
         x = np.arange(len(order)); w = 0.35
         plt.figure(figsize=(7, 5))
-        plt.bar(x - w/2, mA, w, label="Correct SP_Positive", color="#4CAF50")
-        plt.bar(x + w/2, mB, w, label="Correct Negative", color="#F44336")
+        plt.bar(x - w/2, mA, w, label=label_A, color="#4CAF50")
+        plt.bar(x + w/2, mB, w, label=label_B, color="#F44336")
         plt.xticks(x, labels_m); plt.ylabel("Total |SHAP| / sample"); plt.title(f"{prefix} Modality contribution")
         plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"{prefix}_shap_modality_bar.png"), dpi=130); plt.close()
@@ -939,16 +974,16 @@ def run_shap(unwrapped, flags, out_dir, prefix, device):
         if avg_A is not None:
             offs = np.arange(-W, W + 1)
             plt.figure(figsize=(10, 4))
-            plt.plot(offs, avg_A, label="Correct SP_Positive", color="#4CAF50", lw=2)
+            plt.plot(offs, avg_A, label=label_A, color="#4CAF50", lw=2)
             if avg_B is not None:
-                plt.plot(offs, avg_B, label="Correct Negative", color="#F44336", lw=2)
+                plt.plot(offs, avg_B, label=label_B, color="#F44336", lw=2)
             plt.axvline(0, color="gray", ls="--", alpha=0.7, label="GC-box center")
             plt.xlabel("Position rel. GC-box center (bp)"); plt.ylabel("Avg SHAP (L2)")
             plt.title(f"{prefix} sequence SHAP (GC-box flanks)"); plt.legend(); plt.grid(alpha=0.3)
             plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"{prefix}_shap_sequence_line.png"), dpi=130); plt.close()
             if HAVE_SNS:
                 rows = [avg_A] + ([avg_B] if avg_B is not None else [])
-                yl = ["SP_Positive"] + (["Negative"] if avg_B is not None else [])
+                yl = [label_A] + ([label_B] if avg_B is not None else [])
                 plt.figure(figsize=(12, 2.5))
                 sns.heatmap(np.vstack(rows), cmap="viridis", yticklabels=yl,
                             xticklabels=[str(o) for o in range(-W, W + 1)])
