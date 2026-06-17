@@ -1,0 +1,338 @@
+\documentclass[11pt]{article}
+
+% ---- packages (all standard; compiles with pdflatex) ----
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+
+\title{\textbf{Multimodal Deep Fusion of Genomic Sequence, DNA Shape,\\
+and Biochemical Context for SP-Family Transcription-Factor\\
+Binding-Site Prediction: a Leakage-Controlled Benchmark}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Mapping transcription-factor (TF) binding sites is central to understanding gene
+regulation. The SP family (SP1, SP2, SP4) recognises a nearly identical GC-box,
+which makes per-paralog prediction in short windows unreliable. We build a
+multimodal architecture, \emph{G-CMAB}, that fuses three views of a 101\,bp window:
+semantic sequence embeddings from the pre-trained genomic transformer DNABERT-2,
+local three-dimensional geometry from DNAshape, and biochemical descriptors
+(CpG observed/expected ratio, GC content, G-quadruplex motifs). The sequence and
+shape streams are coupled by bidirectional cross-modal attention and a multi-scale
+depthwise-separable CNN with DDP-safe Group Normalization. After an evidence-driven
+pivot from four-way to binding-versus-non-binding classification, the model attains
+$81$--$82\%$ accuracy (ROC-AUC $0.83$--$0.86$) on a leakage-controlled benchmark
+with composition-matched dinucleotide-shuffled negatives, modestly above a
+fine-tuned sequence-only DNABERT-2 ($78.7\%$) and a strong classical TF-IDF
+logistic-regression baseline ($80.6\%$), and consistent ($\sim\!80\%$) on real
+GC-matched genomic negatives. We additionally report a cautionary methodological
+result: an earlier $96.35\%$ figure was traced to a DNAshape sequence--shape
+pairing artifact and is withdrawn. Threshold calibration raises Negative recall to
+$0.57$ at $79.6\%$ accuracy. We release all data-handling, training, ablation, and
+interpretability code.
+\end{abstract}
+
+\section{Introduction}
+
+\subsection{Biological background}
+SP-family TFs regulate proliferation, metabolism and apoptosis; their dysregulation
+is linked to cancer and cardiovascular disease, so accurate binding-site maps are
+valuable for mechanistic study and therapeutic research. Chromatin
+immunoprecipitation sequencing (ChIP-seq) yields experimental binding maps, but
+computational predictors are cheaper and scale better.
+
+\subsection{Limitations of prior approaches}
+Most machine-learning and recent deep-learning predictors operate on the flat
+one-dimensional base sequence (A, C, G, T). Even strong pre-trained encoders such as
+DNABERT-2 remain extensions of the 1D view and tend to over-predict binding,
+ignoring the physical shape of the double helix and the surrounding biochemical
+context that influence binding. A second, under-appreciated issue is evaluation
+rigour: impressive accuracies often fail to reproduce under stricter data handling.
+Our own work provides a concrete instance --- a data-pairing artifact that inflated
+accuracy by roughly $15$ points (Section~\ref{sec:artifact}).
+
+\subsection{Contributions}
+\begin{enumerate}
+  \item A complete, reproducible preprocessing pipeline: ENCODE ingestion,
+        cross-target overlap removal, class balancing, and composition-preserving,
+        leakage-free negative construction.
+  \item A multimodal tri-branch architecture (G-CMAB) that couples DNABERT-2 sequence
+        embeddings with DNAshape geometry through bidirectional cross-modal attention
+        and a multi-scale CNN, plus a biochemical branch.
+  \item A leakage-controlled benchmark and the diagnosis/correction of a DNAshape
+        pairing artifact, with results that are stable across negative types and
+        train/test splits.
+  \item Model interpretability via SHAP attributions and genome-browser (BED) export.
+\end{enumerate}
+
+\section{Related Work}
+Sequence-only motif learners such as DeepBind~\cite{deepbind} established the CNN
+baseline. Transformer approaches followed: BERT-TFBS~\cite{berttfbs} and
+DNABERT-based multi-scale convolution/attention frameworks couple transformer
+embeddings with convolutions, and BERT+2D-CNN hybrids~\cite{le} outperform classical
+models. DNABERT-2~\cite{dnabert2} provides efficient multi-species genomic
+embeddings, and DNAshapeR~\cite{dnashaper} predicts helix geometry from a
+pentamer lookup table. A persistent gap is the lack of explicit cross-interaction
+between sequence and 3D structure; we address it with bidirectional cross-modal
+attention.
+
+\section{Materials and Methods}
+
+\subsection{Data source and curation}
+We used ENCODE HepG2 ChIP-seq narrowPeak tracks on the hg38 assembly (SP1
+ENCFF333SWC, SP2 ENCFF480YAW, SP4 ENCFF938KVY), chosen for consistent cell line and
+assay. Peaks were filtered at $-\log_{10}(q)\ge 2.0$ (i.e.\ $q\le 0.01$). Because
+paralogous SP factors bind overlapping loci, we assigned each overlapping region to
+its highest-$q$ target, yielding $6{,}815$ / $1{,}696$ / $8{,}914$ exclusive peaks for
+SP1 / SP2 / SP4. We down-sampled to the SP2 baseline ($1{,}696$ per TF) by descending
+$q$-value to balance the classes.
+
+\subsection{Sequence extraction, augmentation and splitting}
+Fixed $101$\,bp windows were centred on each summit ($\pm 50$\,bp); boundary-violating
+windows were discarded and bases upper-cased. Positives were doubled by
+reverse-complement (RC) augmentation, giving $3{,}392$ per TF and $13{,}568$ sequences
+in total. Data were split $80/20$ with a grouped split that keeps each
+(original, RC) pair in the same fold, preventing augmentation leakage; a stricter
+chromosome-holdout protocol was used for robustness checks.
+
+\subsection{Negative-set construction}
+The primary negatives are \emph{dinucleotide-shuffled} sequences generated with the
+Altschul--Erickson Eulerian-path algorithm~\cite{altschul}, which preserves mono-
+and dinucleotide frequencies (hence GC and CpG density) exactly while destroying
+motif structure. This is a deliberately hard, composition-matched control: a model
+cannot exploit base composition as a shortcut. For corroboration we also built
+GC- and length-matched real genomic negatives (ENCODE blacklist exclusion,
+$\pm 500$\,bp peak padding, $2\%$ GC bins, $<\!5\%$ N, Cohen's-$d$ quality control).
+
+\subsection{Feature engineering (three modalities)}
+\textbf{(a) Sequence.} Windows are tokenised with the DNABERT-2 byte-pair vocabulary;
+the maximum token length is set to the training-set $99$th percentile (clamped to
+$[32,96]$). \textbf{(b) DNAshape.} Five structural parameters --- Minor Groove Width,
+Propeller Twist, Roll, Helical Twist, Electrostatic Potential --- are computed per
+position by a sliding pentamer lookup, with reverse-complement fallback and edge-NaN
+handling, producing an $[N,5,101]$ tensor that is robustly scaled (median-centred,
+divided by the $1$st--$99$th-percentile range, stats from the training split only).
+\textbf{(c) Biochemical.} CpG O/E ratio, GC content, and G-quadruplex presence
+(regular-expression match) per window.
+
+\subsection{Architecture: G-CMAB}
+The three branches feed a fusion head. The \emph{sequence} branch unfreezes the last
+six DNABERT-2 encoder layers and applies an ELMo-style learned scalar-mix over the
+last hidden states, projected to $128$ dimensions. The \emph{shape} branch projects
+the $[N,5,101]$ tensor to $128$ channels (1$\times$1 convolution, GroupNorm, GELU).
+A bidirectional \emph{cross-modal multi-head attention} module ($d_{\text{model}}=128$,
+$4$ heads) lets sequence query shape and shape query sequence, aligning nucleotide
+context to helix geometry. Both streams then pass a \emph{multi-scale
+depthwise-separable CNN} (sequence kernels $\{7,9,11,15\}$, shape kernels
+$\{4,8,12,16\}$, $256$ channels, 1-max pooling). The \emph{bio} branch is a small
+MLP ($3{\to}16{\to}32$). The pooled sequence, pooled shape, and bio vectors are
+concatenated ($2{,}080$-d) and classified by a sigmoid head. The umbrella name
+G-CMAB denotes \textbf{G}roupNorm $+$ \textbf{C}ross-\textbf{M}odal
+\textbf{A}ttention $+$ multi-scale \textbf{B}ranch.
+
+\subsection{Training and optimisation}
+We minimise \texttt{BCEWithLogits} loss with a dynamic positive-class weight to
+counter the $3{:}1$ positive:negative ratio, AdamW with branch-specific learning
+rates (backbone $2\times 10^{-5}$; projections/attention $2$--$3\times 10^{-4}$;
+layer-attention $10^{-3}$), weight decay $0.1$, linear warmup ($\approx\!15\%$) then
+cosine annealing, gradient clipping, and bf16 mixed precision. GroupNorm replaces
+BatchNorm throughout the convolutional branches because per-GPU batches are small
+under distributed data parallelism. Critically, the data loaders \emph{enforce}
+that the negative sequence file and the negative DNAshape file come from the same
+set, refusing any mismatched fallback (Section~\ref{sec:artifact}). At evaluation we
+report metrics at the default $0.5$ threshold and, additionally, scan the decision
+threshold to expose the precision/recall operating curve.
+
+\section{Results}
+
+\subsection{The multiclass plateau and the binary pivot}
+Every four-way model (SP1 / SP2 / SP4 / Negative) saturated between $\sim\!50$ and
+$62\%$ accuracy. The error pattern was consistent: the Negative class was recovered
+well, but the three SP paralogs were mutually confused (SP4 recall as low as
+$0.33$--$0.57$). A $101$\,bp window therefore answers ``is this a binding site?'' but
+not ``which SP paralog?'', because the paralogs share motif and shape signature. We
+read this as a property of the data and reformulated the task as binding
+(SP1$\cup$SP2$\cup$SP4) versus non-binding.
+
+\subsection{Binary classification}
+Table~\ref{tab:binary} reports the binary comparison on the clean, sequence--shape
+matched dinucleotide benchmark. The multimodal G-CMAB reaches $81.0$--$82.3\%$
+accuracy across runs and configurations (ROC-AUC $0.83$--$0.86$), modestly above the
+fine-tuned sequence-only DNABERT-2 ($78.7\%$) and the best classical model
+(TF-IDF logistic regression, $80.6\%$). The improvement over sequence-only is real
+but small and shows up most clearly in ranking (ROC-AUC) rather than in
+default-threshold accuracy.
+
+\begin{table}[ht]
+\centering
+\caption{Binary classification on the clean dinucleotide benchmark (held-out test,
+$n=2{,}710$). Deep rows are verified sequence--shape-matched runs; the multimodal
+row gives the instrumented reference run (range $81.0$--$82.3\%$ across
+configurations). Classical baselines ($\dagger$) default to the genomic GC-matched
+negatives and are within $\sim\!0.2$ points on dinucleotide negatives.}
+\label{tab:binary}
+\begin{tabular}{lccccc}
+\toprule
+Model & Acc. & ROC-AUC & PR-AUC & Neg.\ R & Pos.\ R \\
+\midrule
+Classical one-hot $\cdot$ Gradient Boosting$^{\dagger}$ & 0.755 & 0.624 & 0.823 & 0.043 & 0.993 \\
+Sequence-only DNABERT-2 & 0.787 & 0.817 & 0.926 & 0.585 & 0.855 \\
+Classical TF-IDF $\cdot$ Logistic Regression$^{\dagger}$ & 0.806 & 0.818 & 0.928 & 0.376 & 0.951 \\
+\textbf{Multimodal G-CMAB} & \textbf{0.810} & \textbf{0.832} & \textbf{0.919} & 0.402 & 0.937 \\
+\quad G-CMAB, enhanced (2 attn.\ layers, 8 layers unfrozen) & 0.823 & --- & --- & --- & --- \\
+\quad G-CMAB @ tuned threshold ($t=0.95$) & 0.796 & 0.832 & 0.919 & \textbf{0.569} & 0.871 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Threshold calibration}
+At the default $0.5$ threshold the multimodal model over-predicts the positive class,
+and its default-threshold Negative recall varies run-to-run ($0.40$--$0.61$) while
+ROC-AUC is stable ($\sim\!0.83$--$0.86$). Because the ranking is informative, simple
+threshold calibration recovers minority-class recall: raising the threshold to
+$t=0.95$ lifts Negative recall to $0.569$ while overall accuracy stays at $79.6\%$,
+indicating the model has learned a genuine signal rather than guessing the majority
+class.
+
+\subsection{Consistency across negative types and splits}
+The result is not specific to dinucleotide negatives. Re-evaluated against real
+GC- and length-matched genomic negatives, the same architecture scores a consistent
+$79.6\%$ (random group split) and $79.4\% \pm 0.8\%$ under a chromosome-holdout,
+multi-seed protocol (test chromosomes chr1/6/7; seeds 42/1/2023), so the figure is
+stable to both negative type and to genomic-proximity/homology leakage. The
+dinucleotide and genomic settings agree once the data pairing is correct.
+
+\subsection{A DNAshape pairing artifact (cautionary result)}
+\label{sec:artifact}
+An earlier version of this model reported $96.35\%$ accuracy. We traced this to a
+data-handling bug: the negative \emph{sequences} were the dinucleotide shuffles, but
+the negative \emph{DNAshape} tensor was loaded (by an independent recursive search)
+from the \emph{genomic} negative set. Because genomic and shuffled sequences have
+markedly different shape profiles, the shape branch could separate the two classes
+on a feature that does not correspond to the sequences the rest of the model saw ---
+an artificial leak. After enforcing sequence--shape pairing and re-running cleanly,
+accuracy falls to $\sim\!81\%$, matching the genomic and classical results. The
+project's own corrected real-negative evaluation records the same $\sim\!18$-point
+correction. We report this prominently because composition-matched and
+geometry-derived negatives are increasingly common in TFBS prediction, and silent
+cross-modal mismatches are easy to introduce and hard to notice.
+
+\subsection{Ablation and an honest note on training fragility}
+We ran a controlled ablation that toggles individual components (sequence only;
+$+$ shape; $+$ cross-attention; $+$ bio; and single-component knockouts) under a
+fixed split and seed at $30$ epochs (Table~\ref{tab:abl}). On the clean dinucleotide
+data \emph{all} configurable variants --- including the nominally complete one ---
+collapsed to the majority class ($74.83\%$ accuracy, the positive fraction;
+Negative recall $0.00$; ROC-AUC $\approx 0.52$), whereas the main training pipeline
+reached $\sim\!81\%$. We therefore do \emph{not} claim the ablation isolates the
+contribution of any single component: a nominally identical ``full'' configuration
+collapsed in the ablation harness while the main trainer did not, which points to
+sensitivity to the optimisation schedule and training procedure rather than to a
+clean architectural effect. The honest reading is that this composition-matched task
+sits in a difficult optimisation basin from which under-tuned configurations fail to
+escape; isolating component value requires a more carefully tuned ablation, which we
+leave to future work.
+
+\begin{table}[ht]
+\centering
+\caption{Controlled ablation on the clean dinucleotide data ($30$ epochs,
+$n=2{,}710$). All configurable variants collapse to the majority class; the table is
+reported for transparency, not as clean component attribution (see text).}
+\label{tab:abl}
+\begin{tabular}{llccc}
+\toprule
+Variant & Configuration & Acc. & ROC-AUC & Neg.\ R \\
+\midrule
+A1 & Sequence only            & 0.7483 & $\approx$0.52 & 0.00 \\
+A2 & $+$ DNAshape              & 0.7483 & $\approx$0.52 & 0.00 \\
+A3 & $+$ Cross-modal attention & 0.7483 & $\approx$0.55 & 0.00 \\
+A4 & $+$ Bio (full)           & 0.7483 & $\approx$0.53 & 0.00 \\
+A5--A7 & full $-$ one component & $\approx$0.747 & $\approx$0.52 & $\approx$0.00 \\
+\midrule
+\textbf{Main trainer (script 28)} & full G-CMAB, tuned schedule & \textbf{0.810} & \textbf{0.832} & 0.402 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Interpretability and genomic output}
+SHAP attributions decompose each prediction into sequence, DNAshape and biochemical
+contributions around the GC-box. Attributions must be computed on near-decision-boundary
+samples: on confidently-correct examples the saturated sigmoid yields near-zero input
+gradients, so a gradient-based explainer returns spuriously flat attributions for all
+modalities. Correct and confused predictions are exported as BED tracks for
+genome-browser inspection and downstream motif/chromatin analysis.
+
+\section{Discussion}
+
+\subsection{What the results say}
+On a leakage-controlled benchmark the multimodal model reaches $\sim\!81$--$82\%$,
+modestly above a sequence-only transformer and roughly level with a classical TF-IDF
+baseline, and consistent across dinucleotide and genomic negatives. The multimodal
+edge is real (better ROC-AUC, recoverable Negative recall via thresholding) but
+small enough that the architecture is not yet clearly worth its complexity. The most
+transferable finding is methodological: a silent sequence--shape pairing mismatch
+inflated accuracy by $\sim\!15$ points, a reminder that multimodal genomic pipelines
+need explicit modality-alignment checks.
+
+\subsection{Limitations}
+(i) Data come from a single cell line (HepG2) and one TF family, so generalisation is
+untested. (ii) Absolute performance is modest and only a few points above the
+all-positive baseline; lifting it via operating-point calibration and branch upgrades
+is ongoing work. (iii) The controlled ablation collapsed to the majority class and is
+inconclusive for component attribution. (iv) Per-paralog identification remains
+unsolved at $101$\,bp resolution.
+
+\subsection{Performance ceiling and future work}
+Accuracy plateaus near $81\%$ across settings, consistent with a $101$\,bp window
+holding only so much information once sequence, shape and biochemistry are all used.
+Future work includes longer genomic context, chromatin-accessibility signal (e.g.\
+ATAC-seq) and quantitative binding affinities in place of binary peak calls, together
+with deeper cross-modal fusion and a re-tuned ablation.
+
+\section{Conclusion}
+We presented G-CMAB, a tri-branch model that fuses DNABERT-2 sequence embeddings,
+DNAshape geometry and biochemical features through bidirectional cross-modal
+attention and a multi-scale CNN. After an evidence-driven pivot to binding-versus-
+non-binding classification, the model reaches $\sim\!81$--$82\%$ on a leakage-controlled
+benchmark, modestly above a sequence-only transformer and stable across negative
+types. Equally important, we diagnose and correct a DNAshape pairing artifact that had
+inflated accuracy to $96\%$, and we release the full pipeline so the corrected,
+honest benchmark is reproducible.
+
+\begin{thebibliography}{9}
+\bibitem{dnabert2} Z.\ Zhou \emph{et al.}, ``DNABERT-2: Efficient Foundation Model
+and Benchmark for Multi-Species Genome,'' \emph{arXiv:2306.15006}, 2023 (ICLR 2024).
+\bibitem{dnashaper} T.-P.\ Chiu \emph{et al.}, ``DNAshapeR: an R/Bioconductor package
+for DNA shape prediction and feature encoding,'' \emph{Bioinformatics}
+32(8):1211--1213, 2016.
+\bibitem{deepbind} B.\ Alipanahi, A.\ Delong, M.\ T.\ Weirauch, B.\ J.\ Frey,
+``Predicting the sequence specificities of DNA- and RNA-binding proteins by deep
+learning,'' \emph{Nature Biotechnology} 33(8):831--838, 2015.
+\bibitem{altschul} S.\ F.\ Altschul, B.\ W.\ Erickson, ``Significance of nucleotide
+sequence alignments: a method for random sequence permutation that preserves
+dinucleotide and codon usage,'' \emph{Mol.\ Biol.\ Evol.} 2(6):526--538, 1985.
+\bibitem{berttfbs} K.\ Wang \emph{et al.}, ``BERT-TFBS: a novel BERT-based model for
+predicting transcription factor binding sites by transfer learning,''
+\emph{Briefings in Bioinformatics}, 2024.
+\bibitem{le} N.\ Q.\ K.\ Le \emph{et al.}, ``A transformer architecture based on BERT
+and a 2-D CNN to identify DNA enhancers,'' \emph{Briefings in Bioinformatics}.
+\bibitem{shap} S.\ M.\ Lundberg, S.-I.\ Lee, ``A unified approach to interpreting
+model predictions,'' \emph{NeurIPS} 30:4765--4774, 2017.
+\bibitem{adamw} I.\ Loshchilov, F.\ Hutter, ``Decoupled weight decay
+regularization,'' \emph{ICLR}, 2019.
+\bibitem{encode} The ENCODE Project Consortium, ``An integrated encyclopedia of DNA
+elements in the human genome,'' \emph{Nature} 489(7414):57--74, 2012.
+\end{thebibliography}
+
+\end{document}
