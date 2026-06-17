@@ -22,6 +22,8 @@ import os
 import sys
 import gc
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -602,7 +604,8 @@ def main():
 
     dummy_labels = [1 if c != "Negative" else 0 for c in all_true]
     dataset = TriBranchDataset(all_seqs, dummy_labels, all_true, all_shapes, tokenizer, max_len)
-    loader = DataLoader(dataset, batch_size=CFG.BATCH_SIZE, shuffle=False)
+    loader = DataLoader(dataset, batch_size=CFG.BATCH_SIZE, shuffle=False,
+                        num_workers=4, pin_memory=True)
 
     print("\nExtracting fused features ...")
     feats, true_classes = [], []
