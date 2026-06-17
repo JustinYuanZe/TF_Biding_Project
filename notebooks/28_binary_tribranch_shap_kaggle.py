@@ -171,7 +171,7 @@ class Config:
     # ── Paths ──
     FASTA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
     SHAPE_DIR = auto_detect_dir("dnashape_sp1.npy", "data/processed")
-    OUTPUT_DIR = "outputs_tribranch_shap"
+    OUTPUT_DIR = "outputs_tribranch_shap_dinuc" if os.environ.get("FORCE_DINUC", "0") == "1" else "outputs_tribranch_shap"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
 
@@ -352,11 +352,15 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         print("=" * 60)
 
     neg_fasta_path = None
-    for cand in ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]:
-        path = find_file(cand, fasta_dir)
-        if path:
-            neg_fasta_path = path
-            break
+    force_dinuc = os.environ.get("FORCE_DINUC", "0") == "1"
+    if force_dinuc:
+        neg_fasta_path = find_file("negative_final.fasta", fasta_dir)
+    else:
+        for cand in ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]:
+            path = find_file(cand, fasta_dir)
+            if path:
+                neg_fasta_path = path
+                break
     if not neg_fasta_path:
         raise FileNotFoundError("Could not find any negative FASTA file among candidates.")
     if accelerator.is_main_process:
@@ -1550,13 +1554,13 @@ if accelerator.is_main_process:
         from IPython.display import FileLink, display as ipy_display
     except ImportError:
         FileLink = ipy_display = None
-    zip_filename = "outputs_tribranch_shap"
+    zip_filename = cfg.OUTPUT_DIR
     shutil.make_archive(zip_filename, 'zip', cfg.OUTPUT_DIR)
     print(f"\nAll outputs zipped into: {zip_filename}.zip")
     if FileLink and ipy_display:
         try:
             ipy_display(FileLink(f"{zip_filename}.zip"))
         except Exception:
-            print(f"Download {zip_filename}.zip from the Kaggle output panel.")
+            print(f"Download {zip_filename}.zip.")
     else:
-        print(f"Download {zip_filename}.zip from the Kaggle output panel.")
+        print(f"Download {zip_filename}.zip.")

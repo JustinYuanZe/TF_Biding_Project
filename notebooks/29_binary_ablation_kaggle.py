@@ -144,7 +144,7 @@ def auto_detect_dir(target_file, fallback="data/processed"):
 class Config:
     FASTA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
     SHAPE_DIR = auto_detect_dir("dnashape_sp1.npy", "data/processed")
-    OUTPUT_DIR = "outputs_ablation"
+    OUTPUT_DIR = "outputs_ablation_dinuc" if os.environ.get("FORCE_DINUC", "0") == "1" else "outputs_ablation"
     DNABERT_MODEL = "zhihan1996/DNABERT-2-117M"
     EMBEDDING_DIM = 768
 
@@ -253,28 +253,38 @@ def load_fasta(filepath):
 
 
 def load_shape_features(data_dir, shape_files):
-    neg_path = None
-    for cand in ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]:
-        p = find_file(cand, data_dir)
-        if p:
-            neg_path = p; break
-    if not neg_path:
-        raise FileNotFoundError("No negative DNAshape file found.")
     all_shapes = []
     for cls, fname in shape_files.items():
-        p = neg_path if cls == "Negative" else find_file(fname, data_dir)
+        p = find_file(fname, data_dir)
         if not p:
-            raise FileNotFoundError(f"Missing DNAshape for {cls}")
+            raise FileNotFoundError(f"Missing DNAshape for {cls} ({fname})")
         all_shapes.append(np.load(p))
     return np.concatenate(all_shapes, axis=0)
 
 
 def load_all_data():
     neg_fa = None
-    for cand in ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]:
-        p = find_file(cand, cfg.FASTA_DIR)
-        if p:
-            neg_fa = p; break
+    force_dinuc = os.environ.get("FORCE_DINUC", "0") == "1"
+    if force_dinuc:
+        neg_fa = find_file("negative_final.fasta", cfg.FASTA_DIR)
+    else:
+        for cand in ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]:
+            p = find_file(cand, cfg.FASTA_DIR)
+            if p:
+                neg_fa = p; break
+    if not neg_fa:
+        raise FileNotFoundError("Missing Negative FASTA file.")
+
+    # Pair the negative DNAshape to the negative FASTA actually chosen
+    NEG_FASTA_TO_SHAPE = {
+        "negative_genomic_matched.fasta": "dnashape_negative_genomic.npy",
+        "negative_promoter_cpg.fasta":    "dnashape_negative_cpg.npy",
+        "negative_final.fasta":           "dnashape_negative.npy",
+    }
+    neg_base = os.path.basename(neg_fa)
+    cfg.SHAPE_FILES["Negative"] = NEG_FASTA_TO_SHAPE.get(neg_base, "dnashape_negative.npy")
+    print(f"  [Pairing] Negative FASTA '{neg_base}' -> required negative shape '{cfg.SHAPE_FILES['Negative']}'")
+
     fasta_files = {"SP1": find_file("sp1_positive_final.fasta", cfg.FASTA_DIR),
                    "SP2": find_file("sp2_positive_final.fasta", cfg.FASTA_DIR),
                    "SP4": find_file("sp4_positive_final.fasta", cfg.FASTA_DIR),
@@ -1147,5 +1157,5 @@ if accelerator.is_main_process and results:
     print(f"  -> {os.path.join(cfg.OUTPUT_DIR, 'ablation_comparison.png')}")
 
     import shutil
-    shutil.make_archive("outputs_ablation", "zip", cfg.OUTPUT_DIR)
-    print("\nAll ablation outputs zipped into: outputs_ablation.zip")
+    shutil.make_archive(cfg.OUTPUT_DIR, "zip", cfg.OUTPUT_DIR)
+    print(f"\nAll ablation outputs zipped into: {cfg.OUTPUT_DIR}.zip")

@@ -151,7 +151,7 @@ class Config:
 
     # ── Paths ──
     DATA_DIR = auto_detect_dir("sp1_positive_final.fasta", "data/processed")
-    OUTPUT_DIR = "outputs_finetune"
+    OUTPUT_DIR = "outputs_finetune_dinuc" if os.environ.get("FORCE_DINUC", "0") == "1" else "outputs_finetune"
     FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
 
@@ -251,12 +251,16 @@ def load_all_data(data_dir):
     print("=" * 60)
 
     # Detect negative FASTA file
-    neg_fasta = "negative_final.fasta"
-    fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
-    for cand in fasta_candidates:
-        if os.path.exists(os.path.join(data_dir, cand)):
-            neg_fasta = cand
-            break
+    force_dinuc = os.environ.get("FORCE_DINUC", "0") == "1"
+    if force_dinuc:
+        neg_fasta = "negative_final.fasta"
+    else:
+        neg_fasta = "negative_final.fasta"
+        fasta_candidates = ["negative_genomic_matched.fasta", "negative_promoter_cpg.fasta", "negative_final.fasta"]
+        for cand in fasta_candidates:
+            if os.path.exists(os.path.join(data_dir, cand)):
+                neg_fasta = cand
+                break
 
     print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta}")
 
@@ -1187,3 +1191,8 @@ print("  │  Script 10: Fine-Tuned DNABERT-2 + Simple Head     │")
 print(f"  │    → Best Val Acc: {max(history['val_acc']):.2%}                      │")
 print("  └─────────────────────────────────────────────────────┘")
 print("=" * 60)
+
+import shutil
+zip_filename = cfg.OUTPUT_DIR
+shutil.make_archive(zip_filename, 'zip', cfg.OUTPUT_DIR)
+print(f"\nAll outputs zipped into: {zip_filename}.zip")
