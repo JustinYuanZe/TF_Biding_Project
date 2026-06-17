@@ -620,6 +620,11 @@ def main():
             feats.append(fused.float().cpu().numpy())
             true_classes.extend(batch["true_class"])
     feats = np.concatenate(feats, axis=0)
+    # Handle NaNs from numerical instabilities on GPU
+    n_nan = int(np.isnan(feats).sum())
+    if n_nan > 0:
+        print(f"  [WARN] Fused feature matrix contains {n_nan} NaN values. Filling them with 0.0 to prevent UMAP/t-SNE crash.")
+        feats = np.nan_to_num(feats, nan=0.0)
     print(f"  Fused feature matrix: {feats.shape}  (expected dim "
           f"{(len(CFG.SEQ_MSCNN_KERNELS)+len(CFG.SHAPE_MSCNN_KERNELS))*CFG.MSCNN_OUT_CHANNELS + 32})")
 
