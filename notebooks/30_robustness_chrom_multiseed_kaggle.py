@@ -84,6 +84,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -237,7 +239,7 @@ class Config:
     WEIGHT_DECAY = 0.1
 
     # ── Training (modest budget for a 3-seed loop; early stopping kicks in) ──
-    BATCH_SIZE = 16
+    BATCH_SIZE = 64
     GRAD_ACCUM_STEPS = 1
     EPOCHS = 14
     PATIENCE = 5
@@ -1187,9 +1189,9 @@ def run_one_seed(seed, cfg, acc):
     # 2) Fresh DataLoaders (shuffle RNG now depends on this seed).
     g = torch.Generator(); g.manual_seed(seed)
     train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True,
-                              num_workers=2, pin_memory=True, drop_last=True, generator=g)
+                              num_workers=8, pin_memory=True, drop_last=True, generator=g)
     test_loader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE * 2, shuffle=False,
-                             num_workers=2, pin_memory=True)
+                             num_workers=8, pin_memory=True)
 
     # 3) Fresh model on the reset backbone.
     model = TriBranchClassifier(backbone=dnabert_model, cfg=cfg)
