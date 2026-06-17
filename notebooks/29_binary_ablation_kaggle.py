@@ -178,8 +178,8 @@ class Config:
     # Ablation training budget (kept modest: this trains MANY models).
     BATCH_SIZE = 64
     GRAD_ACCUM_STEPS = 1
-    EPOCHS = 15
-    PATIENCE = 6
+    EPOCHS = int(os.environ.get("ABLATION_EPOCHS", "30"))   # was 15; 15ep collapsed to all-positive on clean dinuc
+    PATIENCE = 8
     MAX_OVERFITTING_GAP = 30.0
     WARMUP_RATIO = 0.15
     MAX_GRAD_NORM = 0.5

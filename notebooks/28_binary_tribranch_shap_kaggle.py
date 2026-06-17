@@ -185,15 +185,15 @@ class Config:
     MAX_LENGTH_CAP = 96
     MAX_LENGTH_FLOOR = 32
 
-    # ── Fine-Tuning ──
-    UNFREEZE_LAST_N_LAYERS = 6
+    # ── Fine-Tuning ── (env-overridable for capacity / branch-upgrade experiments)
+    UNFREEZE_LAST_N_LAYERS = int(os.environ.get("UNFREEZE_LAST_N", "6"))
     BACKBONE_LR = 2e-5
 
     # ── Cross-Modal Attention ──
     USE_CROSS_ATTN = True
     CROSS_ATTN_D_MODEL = 128
     CROSS_ATTN_NHEAD = 4
-    CROSS_ATTN_LAYERS = 1
+    CROSS_ATTN_LAYERS = int(os.environ.get("CROSS_ATTN_LAYERS", "1"))   # try 2-3 to deepen seq<->shape fusion
     CROSS_ATTN_DROPOUT = 0.1
     CROSS_ATTN_LR = 2e-4
     SEQ_PROJ_LR = 2e-4
@@ -978,9 +978,13 @@ scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 pos_count = int(np.sum(y_train == 1))
 neg_count = int(np.sum(y_train == 0))
 pos_weight_val = float(neg_count) / float(pos_count) if pos_count > 0 else 1.0
+# Recall lever: POS_WEIGHT_SCALE<1 down-weights the positive class -> pushes the model
+# toward predicting Negative more often -> higher Negative recall. Default 1.0 (unchanged).
+pos_weight_val *= float(os.environ.get("POS_WEIGHT_SCALE", "1.0"))
 pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32, device=accelerator.device)
 if accelerator.is_main_process:
-    print(f"  BCE pos_weight: {pos_weight_val:.4f} (neg={neg_count}, pos={pos_count})")
+    print(f"  BCE pos_weight: {pos_weight_val:.4f} (neg={neg_count}, pos={pos_count}, "
+          f"scale={os.environ.get('POS_WEIGHT_SCALE', '1.0')})")
 criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
@@ -1136,6 +1140,34 @@ def full_evaluation(model, test_loader, class_names, acc):
             f.write(f"\nOverall Accuracy: {acc_val:.4f}\nBinary F1: {f1b:.4f}\n")
             f.write(f"ROC-AUC: {roc_auc:.4f}\nPR-AUC (Average Precision): {pr_auc:.4f}\n")
         print(f"Overall Accuracy: {acc_val:.4f} | Binary F1: {f1b:.4f} | ROC-AUC: {roc_auc:.4f} | PR-AUC: {pr_auc:.4f}")
+
+        # ── Threshold tuning (post-hoc recall lever; no retraining) ──
+        # Default decision uses 0.50 (logit>0). With a good ROC-AUC, raising the
+        # threshold trades Positive recall for higher Negative recall.
+        from sklearn.metrics import recall_score, balanced_accuracy_score
+        ths = np.linspace(0.05, 0.95, 181)
+        def _m(t):
+            p = (np.asarray(all_probs) >= t).astype(int)
+            return (accuracy_score(all_targets, p),
+                    balanced_accuracy_score(all_targets, p),
+                    recall_score(all_targets, p, pos_label=0),
+                    recall_score(all_targets, p, pos_label=1))
+        t_bal = float(max(ths, key=lambda t: _m(t)[1]))
+        a_b, ba_b, nr_b, pr_b = _m(t_bal)
+        reach = [t for t in ths if _m(t)[2] >= 0.80]
+        t80 = float(min(reach)) if reach else None
+        with open(os.path.join(cfg.OUTPUT_DIR, "classification_report.txt"), "a") as f:
+            f.write("\n--- Threshold tuning (post-hoc; default threshold = 0.50) ---\n")
+            f.write(f"Best balanced-accuracy threshold = {t_bal:.3f}: "
+                    f"acc={a_b:.4f} bal_acc={ba_b:.4f} NegR={nr_b:.4f} PosR={pr_b:.4f}\n")
+            if t80 is not None:
+                a8, ba8, nr8, pr8 = _m(t80)
+                f.write(f"Lowest threshold reaching NegR>=0.80 = {t80:.3f}: "
+                        f"acc={a8:.4f} bal_acc={ba8:.4f} NegR={nr8:.4f} PosR={pr8:.4f}\n")
+            else:
+                f.write("NegR>=0.80 not reachable at any scanned threshold.\n")
+        print(f"  [Threshold] best-bal t={t_bal:.3f}: acc={a_b:.4f} bal_acc={ba_b:.4f} "
+              f"NegR={nr_b:.4f} PosR={pr_b:.4f}")
     return all_preds, all_targets, all_probs
 
 
