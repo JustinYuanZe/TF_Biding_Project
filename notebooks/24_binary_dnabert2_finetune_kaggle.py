@@ -158,7 +158,7 @@ class Config:
     # ── DNABERT-2 ──
     DNABERT_MODEL = "zhihan1996/DNABERT-2-117M"
     EMBEDDING_DIM = 768
-    MAX_TOKEN_LENGTH = 512
+    MAX_TOKEN_LENGTH = 48
 
     # ── Fine-Tuning Strategy ──
     UNFREEZE_LAST_N_LAYERS = 3    # Unfreeze last 3 of 12 encoder layers
