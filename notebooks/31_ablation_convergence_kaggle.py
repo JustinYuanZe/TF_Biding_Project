@@ -74,6 +74,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -193,7 +195,7 @@ class Config:
     CONVERGENCE_TAIL_MARGIN = 3
     CONVERGENCE_SLOPE_EPS = 1e-4   # min slope (acc/epoch) to call "still improving"
 
-    BATCH_SIZE = 16
+    BATCH_SIZE = 64
     GRAD_ACCUM_STEPS = 1
     MAX_OVERFITTING_GAP = 30.0
     WARMUP_RATIO = 0.15
@@ -1055,8 +1057,8 @@ for variant in ABLATION_VARIANTS:
 
     optimizer = optim.AdamW(build_param_groups(model, cfg))
     train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True,
-                              num_workers=2, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE * 2, shuffle=False, num_workers=2, pin_memory=True)
+                              num_workers=8, pin_memory=True, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE * 2, shuffle=False, num_workers=8, pin_memory=True)
     total_steps = (len(train_loader) // max(cfg.GRAD_ACCUM_STEPS, 1)) * cfg.EPOCHS
     warmup = int(total_steps * cfg.WARMUP_RATIO)
 

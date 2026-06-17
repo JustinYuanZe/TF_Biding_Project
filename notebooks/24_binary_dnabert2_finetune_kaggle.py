@@ -102,6 +102,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -171,8 +173,8 @@ class Config:
     NUM_CLASSES = 1
 
     # ── Training ──
-    BATCH_SIZE = 16               # Per-GPU batch size (T4-friendly)
-    GRAD_ACCUM_STEPS = 4          # Effective batch = 16 * 4 = 64
+    BATCH_SIZE = 64               # Per-GPU batch size
+    GRAD_ACCUM_STEPS = 1          # Effective batch = 64
     EPOCHS = 15
     PATIENCE = 5                  # Early stopping patience
     MAX_OVERFITTING_GAP = 30.0  # Max train-val gap (%) to prevent severe overfitting
@@ -641,11 +643,11 @@ test_dataset = DNASequenceDataset(seq_test, y_test, tokenizer, cfg.MAX_TOKEN_LEN
 
 train_loader = DataLoader(
     train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True,
-    num_workers=2, pin_memory=True, drop_last=True,
+    num_workers=8, pin_memory=True, drop_last=True,
 )
 test_loader = DataLoader(
     test_dataset, batch_size=cfg.BATCH_SIZE * 2, shuffle=False,
-    num_workers=2, pin_memory=True,
+    num_workers=8, pin_memory=True,
 )
 
 print(f"DataLoaders ready: {len(train_loader)} train batches, {len(test_loader)} test batches")
