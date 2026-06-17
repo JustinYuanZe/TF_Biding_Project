@@ -312,16 +312,18 @@ def load_fasta(filepath):
 
 def load_shape_features(data_dir, shape_files):
     all_shapes = []
-    neg_shape_path = None
-    for cand in ["dnashape_negative_genomic.npy", "dnashape_negative_cpg.npy", "dnashape_negative.npy"]:
-        path = find_file(cand, data_dir)
-        if path:
-            neg_shape_path = path
-            break
+    # CRITICAL: the negative DNAshape MUST match the negative FASTA chosen in load_all_data
+    # (shape_files["Negative"] is set to the paired filename there). No silent fallback —
+    # a fallback previously caused a genomic-sequence / dinuc-shape mismatch.
+    neg_shape_name = shape_files["Negative"]
+    neg_shape_path = find_file(neg_shape_name, data_dir)
     if not neg_shape_path:
-        raise FileNotFoundError("Could not find any negative DNAshape file among candidates.")
+        raise FileNotFoundError(
+            f"Required negative DNAshape '{neg_shape_name}' (paired with the chosen negative FASTA) "
+            f"not found in {data_dir}. Refusing to substitute a mismatched negative-shape file."
+        )
     if accelerator.is_main_process:
-        print(f"  [Auto-detect] Using negative shape file: {neg_shape_path}")
+        print(f"  [Pairing] Negative shape file (matched to negative FASTA): {neg_shape_path}")
 
     resolved_paths = {}
     for cls_name, fname in shape_files.items():
@@ -357,6 +359,18 @@ def load_all_data(fasta_dir, shape_dir, shape_files):
         raise FileNotFoundError("Could not find any negative FASTA file among candidates.")
     if accelerator.is_main_process:
         print(f"  [Auto-detect] Using negative FASTA file: {neg_fasta_path}")
+
+    # Pair the negative DNAshape to the negative FASTA actually chosen (prevents seq/shape mismatch).
+    NEG_FASTA_TO_SHAPE = {
+        "negative_genomic_matched.fasta": "dnashape_negative_genomic.npy",
+        "negative_promoter_cpg.fasta":    "dnashape_negative_cpg.npy",
+        "negative_final.fasta":           "dnashape_negative.npy",
+    }
+    neg_base = os.path.basename(neg_fasta_path)
+    shape_files = dict(shape_files)
+    shape_files["Negative"] = NEG_FASTA_TO_SHAPE.get(neg_base, shape_files.get("Negative", "dnashape_negative.npy"))
+    if accelerator.is_main_process:
+        print(f"  [Pairing] Negative FASTA '{neg_base}' -> required negative shape '{shape_files['Negative']}'")
 
     fasta_files = {
         "SP1": find_file("sp1_positive_final.fasta", fasta_dir),
