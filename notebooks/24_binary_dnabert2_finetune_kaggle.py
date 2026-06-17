@@ -946,6 +946,24 @@ def full_evaluation(model, test_loader, class_names, device):
     print(f"Overall Accuracy:  {acc:.4f}")
     print(f"Macro F1-Score:    {f1_macro:.4f}")
 
+    # Save a classification_report.txt so the run leaves a parseable artifact
+    try:
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        roc = roc_auc_score(all_targets, all_probs)
+        prauc = average_precision_score(all_targets, all_probs)
+    except Exception:
+        roc, prauc = float("nan"), float("nan")
+    report_txt = classification_report(all_targets, all_preds, target_names=class_names, digits=4)
+    with open(os.path.join(cfg.OUTPUT_DIR, "classification_report.txt"), "w") as f:
+        f.write("CLASSIFICATION REPORT -- Sequence-only DNABERT-2 fine-tune (Script 24)\n")
+        f.write("=" * 60 + "\n")
+        f.write(report_txt + "\n\n")
+        f.write(f"Overall Accuracy: {acc:.4f}\n")
+        f.write(f"Binary F1: {f1_macro:.4f}\n")
+        f.write(f"ROC-AUC: {roc:.4f}\n")
+        f.write(f"PR-AUC (Average Precision): {prauc:.4f}\n")
+    print(f"  Saved classification report -> {os.path.join(cfg.OUTPUT_DIR, 'classification_report.txt')}")
+
     return all_preds, all_targets, all_probs
 
 
